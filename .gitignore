@@ -1,3 +1,5 @@
 huggingface_token.txt
 project_files/
 .DS_Store
+demo_encoder.py
+*.pyc
