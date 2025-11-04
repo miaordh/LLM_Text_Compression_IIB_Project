@@ -36,3 +36,9 @@ def counts_to_cum_desc(counts: List[int]) -> List[int]:
         cum.append(total - s)
     return cum
 
+def get_context_slice(idx, model, token_ids):
+    start = 0
+    if idx > model.config.max_position_embeddings - 1:
+        start = idx - (model.config.max_position_embeddings - 1)
+    return token_ids[start:idx]
+

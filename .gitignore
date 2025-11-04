@@ -3,3 +3,4 @@ project_files/
 .DS_Store
 demo_encoder.py
 *.pyc
+arithmetic-coding-chapter.pdf
