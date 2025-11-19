@@ -148,9 +148,15 @@ def counts_to_cum_desc(counts: List[int]) -> List[int]:
         cum.append(total - s)
     return cum
 
-def get_context_slice(idx, model, token_ids):
+def get_context_slice(idx, model, token_ids, context_window=None):
+    """Return the portion of token_ids used as context for predicting position idx."""
+    max_positions = getattr(model.config, "max_position_embeddings", None)
     start = 0
-    if idx > model.config.max_position_embeddings - 1:
-        start = idx - (model.config.max_position_embeddings - 1)
+    if max_positions is not None and idx > max_positions - 1:
+        start = idx - (max_positions - 1)
+    if context_window is not None:
+        if context_window <= 0:
+            raise ValueError("context_window must be positive")
+        start = max(start, idx - context_window)
     return token_ids[start:idx]
 

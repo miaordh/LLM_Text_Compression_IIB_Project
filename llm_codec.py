@@ -1,5 +1,7 @@
 import csv
 import math
+from typing import Optional
+
 import torch
 from bitReadWrite import BitWriter, BitReader
 from arithmetic_coding import Coder
@@ -10,7 +12,7 @@ from tqdm import tqdm
 
 class LLM_Encode:
     """Encode text into compressed bitstream using LLM-based probabilities."""
-    def __init__(self, tokenizer, model, precision=32):
+    def __init__(self, tokenizer, model, precision=32, context_window: Optional[int] = 1024):
         self.tokenizer = tokenizer
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = model.to(self.device)
@@ -19,6 +21,9 @@ class LLM_Encode:
             self.tokenizer.add_special_tokens({"additional_special_tokens": ["<EOF>"]})
             self.model.resize_token_embeddings(len(self.tokenizer))
         self.precision = precision
+        if context_window is not None and context_window <= 0:
+            raise ValueError("context_window must be positive or None")
+        self.context_window = context_window
         self.model.eval()
 
     def encode(self, text, demo: bool = False, demo_csv_path: str = "llm_encode_probs.csv"):
@@ -40,7 +45,7 @@ class LLM_Encode:
 
         print("Encoding tokens. Progress:")
         for i, token_id in tqdm(enumerate(token_ids), total=len(token_ids)):
-            context_ids = get_context_slice(i, self.model, token_ids)
+            context_ids = get_context_slice(i, self.model, token_ids, self.context_window)
             if len(context_ids) == 0:
                 # Some models may not accept empty input_ids; fall back to using a pad token if available, else uniform
                 if self.tokenizer.pad_token_id is not None:
@@ -90,7 +95,7 @@ class LLM_Encode:
         return encoded
 
 class LLM_Decode:
-    def __init__(self, tokenizer, model, precision=32):
+    def __init__(self, tokenizer, model, precision=32, context_window: Optional[int] = 1024):
         self.tokenizer = tokenizer
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = model.to(self.device)
@@ -99,6 +104,9 @@ class LLM_Decode:
             self.tokenizer.add_special_tokens({"additional_special_tokens": ["<EOF>"]})
             self.model.resize_token_embeddings(len(self.tokenizer))
         self.precision = precision
+        if context_window is not None and context_window <= 0:
+            raise ValueError("context_window must be positive or None")
+        self.context_window = context_window
 
         self.model.eval()
 
@@ -115,7 +123,7 @@ class LLM_Decode:
 
         token_id = None
         while token_id is None or token_id != self.tokenizer.convert_tokens_to_ids("<EOF>"):
-            context_ids = get_context_slice(len(decoded_token_ids), self.model, decoded_token_ids)
+            context_ids = get_context_slice(len(decoded_token_ids), self.model, decoded_token_ids, self.context_window)
             if len(context_ids) == 0:
                 # Some models may not accept empty input_ids; fall back to using a pad token if available, else uniform
                 if self.tokenizer.pad_token_id is not None:
