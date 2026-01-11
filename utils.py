@@ -160,3 +160,10 @@ def get_context_slice(idx, model, token_ids, context_window=None):
         start = max(start, idx - context_window)
     return token_ids[start:idx]
 
+def get_context_slice(idx, model, token_ids):
+    """Return the portion of token_ids used as context for predicting position idx."""
+    max_positions = getattr(model.config, "max_position_embeddings", None)
+    start = 0
+    if max_positions is not None and idx > max_positions - 1:
+        start = idx - (max_positions - 1)
+    return token_ids[start:idx]
