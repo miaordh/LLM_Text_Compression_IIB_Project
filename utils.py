@@ -12,7 +12,63 @@ def counts_to_cumulative_ascending(counts: list[int]) -> list[int]:
 
 
 
-def probs_to_counts(probs: List[float], total: int, dec_prec: int = 200) -> List[int]:
+import torch
+import numpy as np
+
+def probs_to_counts(probs: np.ndarray, total: int, dec_prec: int = 0) -> List[int]:
+    """
+    Fast Vectorized Version.
+    Converts probabilities to integer counts summing EXACTLY to total.
+    """
+    # 1. Convert to simple Float64 numpy array (Avoid Decimal for speed)
+    # The precision of Float64 is enough for compression if we handle the sum carefully.
+    ps = probs.astype(np.float64)
+    
+    # 2. Scale up to integers
+    # counts = floor(p * total)
+    counts = np.floor(ps * total).astype(np.int64)
+    
+    # 3. Handle the "Remainder" (The rounding error)
+    # The sum of floors will be less than total. We must distribute the difference.
+    current_sum = counts.sum()
+    remainder = total - current_sum
+    
+    if remainder > 0:
+        # Distribute the remainder to the tokens with the largest rounding errors
+        # logic: (p*total) - floor(p*total)
+        errors = (ps * total) - counts
+        
+        # Get indices of the largest errors (we only need 'remainder' of them)
+        # argpartition is O(N), much faster than sort O(N log N)
+        if remainder > len(counts):
+             # Rare edge case: add 1 to everyone, then fix remainder
+             counts += (remainder // len(counts))
+             remainder %= len(counts)
+        
+        # Add 1 to the 'remainder' indices with highest fractional parts
+        indices = np.argpartition(errors, -remainder)[-remainder:]
+        counts[indices] += 1
+        
+    # 4. Safety Check: Ensure no count is 0 if probability was > 0
+    # (Optional: In extremely rare cases, a tiny prob might floor to 0. 
+    #  We steal 1 from the largest count to give to the zero-count.)
+    zeros = (counts == 0) & (ps > 0)
+    if zeros.any():
+        zero_indices = np.where(zeros)[0]
+        # Find the richest bucket to tax
+        rich_index = np.argmax(counts)
+        for idx in zero_indices:
+            if counts[rich_index] > 1:
+                counts[rich_index] -= 1
+                counts[idx] = 1
+            else:
+                # If even the richest bucket is poor, we have a crisis (vocab too big for 'total')
+                # But usually 'total' (2^16 or 2^32) >> vocab size
+                pass 
+
+    return counts.tolist()
+
+def probs_to_counts_legacy(probs: List[float], total: int, dec_prec: int = 200) -> List[int]:
     """
     Convert probs -> integer counts summing to total using Decimal arithmetic.
     - probs: list of nonnegative floats (may be raw python floats or Decimal-compatible strings)

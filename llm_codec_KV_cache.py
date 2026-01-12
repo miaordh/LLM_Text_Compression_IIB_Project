@@ -122,7 +122,7 @@ class LLM_Encode_KV_Cache(_KVCacheMixin):
         bit_writer = BitWriter()
         coder_enc = Coder(b=self.precision)
         enc = Encoder(coder_enc, bit_writer)
-        slots = coder_enc.tb
+        slots = 1 << 24
 
         dec_prec = max(50, int(math.ceil(self.precision * math.log10(2))) + 10)
 
@@ -196,7 +196,7 @@ class LLM_Decode_KV_Cache(_KVCacheMixin):
         dec = Decoder(coder_dec, bit_reader)
 
         decoded_token_ids = []
-        slots = coder_dec.tb
+        slots = 1 << 24
 
         dec_prec = max(50, int(math.ceil(self.precision * math.log10(2))) + 10)
 
