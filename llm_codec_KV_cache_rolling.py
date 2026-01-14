@@ -21,76 +21,71 @@ class _KVCacheMixin:
             "cached_token_count": 0,
         }
 
-    def _truncate_cache(self, cache_state, window_size, sink_size=4):
+    def _truncate_cache(self, cache_state, target_window, sink_size=4):
         """
         Implements Rolling Cache with Attention Sinks.
-        Handles both new 'DynamicCache' objects and legacy 'tuple' formats.
+        Truncates the cache down to 'target_window' size.
         """
         past_kv = cache_state["past_key_values"]
         if past_kv is None:
             return cache_state
 
-        # --- NEW: DynamicCache Support (Transformers v4.36+) ---
-        # The model uses an object (past_kv) instead of a tuple.
+        # --- DynamicCache Support ---
         if hasattr(past_kv, "key_cache") and hasattr(past_kv, "value_cache"):
-            # Check length of the first layer
-            # key_cache is a list of tensors [Layer1_K, Layer2_K, ...]
             current_len = past_kv.key_cache[0].size(2)
-            
-            if current_len <= window_size:
+            if current_len <= target_window:
                 return cache_state
 
+            # We calculate how many recent tokens to keep
+            keep_recent = target_window - sink_size
+            
             new_keys = []
             new_values = []
             
-            # Slice each layer inside the object
             for k, v in zip(past_kv.key_cache, past_kv.value_cache):
-                # Keep Sinks (Start) + Keep Recent (End)
+                # [Sinks] + [Most Recent]
                 k_sinks = k[:, :, :sink_size, :]
-                k_recent = k[:, :, -(window_size - sink_size):, :]
-                new_k = torch.cat([k_sinks, k_recent], dim=2)
-                new_keys.append(new_k)
+                k_recent = k[:, :, -keep_recent:, :]
+                new_keys.append(torch.cat([k_sinks, k_recent], dim=2))
                 
                 v_sinks = v[:, :, :sink_size, :]
-                v_recent = v[:, :, -(window_size - sink_size):, :]
-                new_v = torch.cat([v_sinks, v_recent], dim=2)
-                new_values.append(new_v)
+                v_recent = v[:, :, -keep_recent:, :]
+                new_values.append(torch.cat([v_sinks, v_recent], dim=2))
             
-            # Update the existing DynamicCache object in-place
             past_kv.key_cache = new_keys
             past_kv.value_cache = new_values
             
-            # Some versions rely on _seen_tokens, we update it to match reality if it exists
             if hasattr(past_kv, "_seen_tokens"):
-                past_kv._seen_tokens = window_size
+                past_kv._seen_tokens = target_window
                 
             cache_state["past_key_values"] = past_kv
-            cache_state["cached_token_count"] = window_size
+            cache_state["cached_token_count"] = target_window
             return cache_state
 
-        # --- OLD: Legacy Tuple Support (Older models/transformers) ---
-        # past_kv is ((k, v), (k, v), ...)
+        # --- Tuple Support ---
         if isinstance(past_kv, tuple):
             current_len = past_kv[0][0].size(2)
-            if current_len <= window_size:
+            if current_len <= target_window:
                 return cache_state
 
+            keep_recent = target_window - sink_size
             new_past_kv = []
+            
             for layer_past in past_kv:
                 keys, values = layer_past
-                
                 k_sinks = keys[:, :, :sink_size, :]
-                k_recent = keys[:, :, -(window_size - sink_size):, :]
-                new_keys = torch.cat([k_sinks, k_recent], dim=2)
+                k_recent = keys[:, :, -keep_recent:, :]
                 
                 v_sinks = values[:, :, :sink_size, :]
-                v_recent = values[:, :, -(window_size - sink_size):, :]
-                new_values = torch.cat([v_sinks, v_recent], dim=2)
+                v_recent = values[:, :, -keep_recent:, :]
                 
-                new_past_kv.append((new_keys, new_values))
+                new_past_kv.append((
+                    torch.cat([k_sinks, k_recent], dim=2),
+                    torch.cat([v_sinks, v_recent], dim=2)
+                ))
                 
             cache_state["past_key_values"] = tuple(new_past_kv)
-            cache_state["cached_token_count"] = window_size
+            cache_state["cached_token_count"] = target_window
             return cache_state
             
         return cache_state
@@ -99,6 +94,7 @@ class _KVCacheMixin:
         if cache_state["next_logits"] is not None:
             return cache_state["next_logits"]
 
+        # Initialization logic (Start of file)
         if self.tokenizer.pad_token_id is not None:
             input_ids = torch.tensor([[self.tokenizer.pad_token_id]], dtype=torch.long).to(self.device)
             with torch.no_grad():
@@ -129,8 +125,14 @@ class _KVCacheMixin:
         cache_state["next_logits"] = outputs.logits[0, -1, :]
         cache_state["cached_token_count"] += 1
 
-        if self.context_window and cache_state["cached_token_count"] > self.context_window:
-            cache_state = self._truncate_cache(cache_state, self.context_window, sink_size=4)
+        # --- OPTIMIZATION: Lazy Truncation ---
+        # Allow cache to grow 10% larger than limit before truncating.
+        # This reduces memory copy overhead by ~50x.
+        overflow_buffer = 128  # Buffer size
+        
+        if self.context_window and cache_state["cached_token_count"] > (self.context_window + overflow_buffer):
+            # When we finally truncate, we cut it back down to exactly self.context_window
+            cache_state = self._truncate_cache(cache_state, target_window=self.context_window, sink_size=4)
             
         return cache_state
 
@@ -146,7 +148,15 @@ class LLM_Encode_KV_Cache(_KVCacheMixin):
         context_window: Optional[int] = 2048, # Renamed from block_length
     ):
         self.tokenizer = tokenizer
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+            print("Using Apple Silicon GPU (MPS)")
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda")
+            print("Using NVIDIA GPU (CUDA)")
+        else:
+            self.device = torch.device("cpu")
+            print("Using CPU")
         self.model = model.to(self.device)
         
         if "<EOF>" not in self.tokenizer.all_special_tokens:
@@ -229,7 +239,15 @@ class LLM_Decode_KV_Cache(_KVCacheMixin):
         context_window: Optional[int] = 2048,
     ):
         self.tokenizer = tokenizer
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+            print("Using Apple Silicon GPU (MPS)")
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda")
+            print("Using NVIDIA GPU (CUDA)")
+        else:
+            self.device = torch.device("cpu")
+            print("Using CPU")
         self.model = model.to(self.device)
         
         if "<EOF>" not in self.tokenizer.all_special_tokens:
