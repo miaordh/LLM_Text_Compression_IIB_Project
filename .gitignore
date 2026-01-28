@@ -4,3 +4,6 @@ project_files/
 demo_encoder.py
 *.pyc
 arithmetic-coding-chapter.pdf
+*.png
+*.jpg
+*.jpeg
