@@ -17,55 +17,57 @@ import numpy as np
 
 def probs_to_counts(probs: np.ndarray, total: int, dec_prec: int = 0) -> List[int]:
     """
-    Fast Vectorized Version.
-    Converts probabilities to integer counts summing EXACTLY to total.
+    Robust Vectorized Version.
+    1. Converts probabilities to integer counts.
+    2. GUARANTEES no zero counts (fixes 'R became zero' crash).
+    3. GUARANTEES sum equals 'total' exactly (deterministically).
     """
-    # 1. Convert to simple Float64 numpy array (Avoid Decimal for speed)
-    # The precision of Float64 is enough for compression if we handle the sum carefully.
+    # [Safety] Ensure input is 1D and Float64
+    probs = np.atleast_1d(probs)
     ps = probs.astype(np.float64)
     
-    # 2. Scale up to integers
-    # counts = floor(p * total)
+    # 1. Floor to get base counts
     counts = np.floor(ps * total).astype(np.int64)
     
-    # 3. Handle the "Remainder" (The rounding error)
-    # The sum of floors will be less than total. We must distribute the difference.
-    current_sum = counts.sum()
-    remainder = total - current_sum
+    # 2. [CRITICAL FIX] Force Minimum Count of 1
+    # Arithmetic coding crashes if a valid symbol has 0 probability mass.
+    counts[counts == 0] = 1
     
-    if remainder > 0:
-        # Distribute the remainder to the tokens with the largest rounding errors
-        # logic: (p*total) - floor(p*total)
-        errors = (ps * total) - counts
+    # 3. Re-normalize sum to strictly match 'total'
+    current_sum = np.sum(counts)
+    diff = current_sum - total
+    
+    if diff == 0:
+        return counts.tolist()
+    
+    if diff > 0:
+        # We added too much (by forcing 0 -> 1).
+        # We must subtract 'diff' from the highest frequency tokens.
         
-        # Get indices of the largest errors (we only need 'remainder' of them)
-        # argpartition is O(N), much faster than sort O(N log N)
-        if remainder > len(counts):
-             # Rare edge case: add 1 to everyone, then fix remainder
-             counts += (remainder // len(counts))
-             remainder %= len(counts)
+        # Sort descending by count. 
+        # Use kind='stable' to ensure cross-platform determinism.
+        indices = np.argsort(counts, kind='stable')[::-1]
         
-        # Add 1 to the 'remainder' indices with highest fractional parts
-        indices = np.argpartition(errors, -remainder)[-remainder:]
-        counts[indices] += 1
-        
-    # 4. Safety Check: Ensure no count is 0 if probability was > 0
-    # (Optional: In extremely rare cases, a tiny prob might floor to 0. 
-    #  We steal 1 from the largest count to give to the zero-count.)
-    zeros = (counts == 0) & (ps > 0)
-    if zeros.any():
-        zero_indices = np.where(zeros)[0]
-        # Find the richest bucket to tax
-        rich_index = np.argmax(counts)
-        for idx in zero_indices:
-            if counts[rich_index] > 1:
-                counts[rich_index] -= 1
-                counts[idx] = 1
-            else:
-                # If even the richest bucket is poor, we have a crisis (vocab too big for 'total')
-                # But usually 'total' (2^16 or 2^32) >> vocab size
-                pass 
+        for i in indices:
+            if diff == 0: break
+            if counts[i] > 1:
+                can_take = counts[i] - 1
+                to_take = min(diff, can_take)
+                counts[i] -= to_take
+                diff -= to_take
 
+    elif diff < 0:
+        # Floor caused sum to be too low.
+        # Add to the tokens with largest rounding error.
+        errors = (ps * total) - counts
+        indices = np.argsort(errors, kind='stable')[::-1]
+        
+        to_add = -diff
+        for i in indices:
+            if to_add == 0: break
+            counts[i] += 1
+            to_add -= 1
+            
     return counts.tolist()
 
 def probs_to_counts_legacy(probs: List[float], total: int, dec_prec: int = 200) -> List[int]:
@@ -223,3 +225,64 @@ def get_context_slice(idx, model, token_ids):
     if max_positions is not None and idx > max_positions - 1:
         start = idx - (max_positions - 1)
     return token_ids[start:idx]
+
+def stabilize_logits(logits, decimals=5):
+    # 1. Cast to float32 (Crucial for MPS/FP16 models)
+    logits = logits.float()
+    # 2. Softmax
+    probs = torch.softmax(logits, dim=-1)
+    # 3. Move to CPU/Numpy
+    probs = probs.detach().cpu().numpy()
+    # 4. Round to mask Kernel Mismatch
+    probs = np.round(probs, decimals)
+    # 5. Re-normalize to sum exactly 1.0
+    probs = probs / probs.sum()
+    return probs
+
+# In utils.py
+
+import torch
+
+def deterministic_softmax(logits, dim=-1, decimals=6):
+    """
+    Computes Softmax with strict Cross-Device Determinism (CPU vs MPS).
+    
+    1. Moves to CPU.
+    2. [NEW] Rounds LOGITS to eliminate hardware matmul noise.
+    3. Upcasts to Float64.
+    4. Rounds PROBS for final alignment.
+    """
+    # 1. Move to CPU immediately
+    # We cannot trust MPS math to match CPU math perfectly.
+    logits_cpu = logits.detach().cpu()
+    
+    # 2. [THE NUCLEAR FIX] Quantize Logits
+    # CPU: 12.3456781  vs  MPS: 12.3456789
+    # Rounding to 4 decimals snaps both to 12.3457
+    # This sacrifices tiny precision for absolute determinism.
+    logit_precision = 10000.0  # 4 decimal places
+    logits_quant = torch.round(logits_cpu * logit_precision) / logit_precision
+    
+    # 3. Upcast to Float64 for the Softmax Summation
+    logits_64 = logits_quant.to(dtype=torch.float64)
+    
+    # 4. Standard Softmax (now on sanitized inputs)
+    max_logits = torch.max(logits_64, dim=dim, keepdim=True)[0]
+    exps = torch.exp(logits_64 - max_logits)
+    sum_exps = torch.sum(exps, dim=dim, keepdim=True)
+    probs_64 = exps / sum_exps
+    
+    # 5. Convert to Numpy
+    probs = probs_64.numpy()
+    
+    # 6. Final Probability Rounding (Snaps '0.3333331' to '0.333333')
+    probs = np.round(probs, decimals)
+    
+    # 7. Re-normalize (Fixes sum=1.0 invariant after rounding)
+    probs_sum = probs.sum()
+    if probs_sum == 0:
+        probs[:] = 1.0 / len(probs)
+    else:
+        probs /= probs_sum
+        
+    return probs

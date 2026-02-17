@@ -4,7 +4,7 @@ import time
 import torch
 import numpy as np
 import gc
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -20,7 +20,7 @@ from bitReadWrite import BitWriter, BitReader
 from arithmetic_coding import Coder
 from encoder import Encoder
 from decoder import Decoder
-from utils import counts_to_cum_desc, probs_to_counts, probs_to_counts_legacy
+from utils import counts_to_cum_desc, probs_to_counts, probs_to_counts_legacy, deterministic_softmax
 
 class LLM_Codec_Base:
     """
@@ -234,6 +234,203 @@ class _KVCacheMixin:
 
 
 class LLM_Encoder(LLM_Codec_Base, _KVCacheMixin):
+    def __init__(
+        self,
+        *args,
+        parallel: bool = False,
+        parallel_batch_size: int = 16,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.parallel = parallel
+        self.parallel_batch_size = max(1, int(parallel_batch_size))
+
+    def _get_pad_token_id(self) -> int:
+        if self.tokenizer.pad_token_id is not None:
+            return self.tokenizer.pad_token_id
+        if self.tokenizer.eos_token_id is not None:
+            return self.tokenizer.eos_token_id
+        if self.tokenizer.bos_token_id is not None:
+            return self.tokenizer.bos_token_id
+        return 0
+
+    def _get_bos_logits(self) -> torch.Tensor:
+        bos = self.tokenizer.bos_token_id if self.tokenizer.bos_token_id is not None else self.tokenizer.pad_token_id
+        if bos is None:
+            return torch.log(torch.ones(self.tokenizer.vocab_size).to(self.device))
+        input_ids = torch.tensor([[bos]], dtype=torch.long).to(self.device)
+        with torch.no_grad():
+            outputs = self.model(input_ids, use_cache=False)
+        return outputs.logits[0, -1, :]
+
+    def _encode_one_token(
+        self,
+        idx: int,
+        token_id: int,
+        logits: torch.Tensor,
+        enc: Encoder,
+        demo: bool,
+        demo_rows: List[Dict[str, Any]],
+    ):
+        # [CHANGE] Use deterministic_softmax instead of standard softmax
+        # This returns a Numpy array directly, ensuring Float64 precision was used for the sum.
+        probs = deterministic_softmax(logits, dim=-1)
+
+        if demo:
+            p = float(probs[token_id])
+            safe_p = max(p, 1e-12)
+            demo_rows.append({
+                "pos": idx,
+                "token_id": token_id,
+                "token": self.tokenizer.decode([token_id]),
+                "prob": p,
+                "perplexity": 1.0 / safe_p,
+                "surprisal_bits": -math.log2(safe_p)
+            })
+
+        if self.use_legacy_counts:
+            counts = probs_to_counts_legacy(probs, self.slots, self.dec_prec)
+        else:
+            counts = probs_to_counts(probs, self.slots, self.dec_prec)
+        cum_desc = counts_to_cum_desc(counts)
+        enc.encode_symbol(token_id, cum_desc)
+
+    def _encode_parallel_no_kv(
+        self,
+        token_ids: List[int],
+        enc: Encoder,
+        demo: bool,
+        speed_demo: bool,
+    ) -> Tuple[List[Dict[str, float]], List[Dict[str, Any]]]:
+        speed_rows: List[Dict[str, float]] = []
+        demo_rows: List[Dict[str, Any]] = []
+        total = len(token_ids)
+        if total == 0:
+            return speed_rows, demo_rows
+
+        pad_id = self._get_pad_token_id()
+        batch_size = self.parallel_batch_size
+        pbar = tqdm(total=total)
+
+        t0 = time.perf_counter()
+        self._encode_one_token(0, token_ids[0], self._get_bos_logits(), enc, demo, demo_rows)
+        if speed_demo:
+            speed_rows.append({"pos": 0, "time": time.perf_counter() - t0})
+        pbar.update(1)
+
+        for batch_start in range(1, total, batch_size):
+            batch_pos = list(range(batch_start, min(batch_start + batch_size, total)))
+            contexts = [token_ids[max(0, i - self.context_window):i] for i in batch_pos]
+            lengths = [len(c) for c in contexts]
+            max_len = max(lengths)
+            input_ids = torch.full((len(batch_pos), max_len), pad_id, dtype=torch.long, device=self.device)
+            attention_mask = torch.zeros((len(batch_pos), max_len), dtype=torch.long, device=self.device)
+
+            for row_idx, context in enumerate(contexts):
+                context_len = len(context)
+                if context_len > 0:
+                    input_ids[row_idx, :context_len] = torch.tensor(context, dtype=torch.long, device=self.device)
+                    attention_mask[row_idx, :context_len] = 1
+
+            batch_t0 = time.perf_counter()
+            with torch.no_grad():
+                outputs = self.model(input_ids, attention_mask=attention_mask, use_cache=False)
+            elapsed = time.perf_counter() - batch_t0
+            per_token_elapsed = elapsed / max(1, len(batch_pos))
+
+            for row_idx, pos in enumerate(batch_pos):
+                token_t0 = time.perf_counter()
+                logits = outputs.logits[row_idx, lengths[row_idx] - 1, :]
+                self._encode_one_token(pos, token_ids[pos], logits, enc, demo, demo_rows)
+                if speed_demo:
+                    overhead = time.perf_counter() - token_t0
+                    speed_rows.append({"pos": pos, "time": per_token_elapsed + overhead})
+                pbar.update(1)
+
+        pbar.close()
+        return speed_rows, demo_rows
+
+    def _encode_parallel_block(
+        self,
+        token_ids: List[int],
+        enc: Encoder,
+        demo: bool,
+        speed_demo: bool,
+    ) -> Tuple[List[Dict[str, float]], List[Dict[str, Any]]]:
+        speed_rows: List[Dict[str, float]] = []
+        demo_rows: List[Dict[str, Any]] = []
+        total = len(token_ids)
+        if total == 0:
+            return speed_rows, demo_rows
+
+        pbar = tqdm(total=total)
+        t0 = time.perf_counter()
+        self._encode_one_token(0, token_ids[0], self._get_bos_logits(), enc, demo, demo_rows)
+        if speed_demo:
+            speed_rows.append({"pos": 0, "time": time.perf_counter() - t0})
+        pbar.update(1)
+
+        block_items = []
+        for block_start in range(0, total, self.block_stride):
+            block_end = min(block_start + self.block_stride, total)
+            first_target = max(block_start, 1)
+            if first_target >= block_end:
+                continue
+
+            warmup_start = max(0, block_start - self.margin)
+            warmup_tokens = token_ids[warmup_start:block_start]
+            prefix_tokens = warmup_tokens + token_ids[block_start:block_end - 1]
+            if len(prefix_tokens) == 0:
+                continue
+
+            warmup_len = len(warmup_tokens)
+            mapping = []
+            for pos in range(first_target, block_end):
+                out_idx = warmup_len - 1 + (pos - block_start)
+                mapping.append((pos, out_idx))
+
+            block_items.append({"seq": prefix_tokens, "mapping": mapping})
+
+        if not block_items:
+            pbar.close()
+            return speed_rows, demo_rows
+
+        pad_id = self._get_pad_token_id()
+        batch_size = self.parallel_batch_size
+        for batch_start in range(0, len(block_items), batch_size):
+            batch_items = block_items[batch_start:batch_start + batch_size]
+            lengths = [len(item["seq"]) for item in batch_items]
+            max_len = max(lengths)
+
+            input_ids = torch.full((len(batch_items), max_len), pad_id, dtype=torch.long, device=self.device)
+            attention_mask = torch.zeros((len(batch_items), max_len), dtype=torch.long, device=self.device)
+            for row_idx, item in enumerate(batch_items):
+                seq = item["seq"]
+                seq_len = len(seq)
+                input_ids[row_idx, :seq_len] = torch.tensor(seq, dtype=torch.long, device=self.device)
+                attention_mask[row_idx, :seq_len] = 1
+
+            batch_t0 = time.perf_counter()
+            with torch.no_grad():
+                outputs = self.model(input_ids, attention_mask=attention_mask, use_cache=False)
+            elapsed = time.perf_counter() - batch_t0
+
+            token_count = sum(len(item["mapping"]) for item in batch_items)
+            per_token_elapsed = elapsed / max(1, token_count)
+
+            for row_idx, item in enumerate(batch_items):
+                for pos, out_idx in item["mapping"]:
+                    token_t0 = time.perf_counter()
+                    logits = outputs.logits[row_idx, out_idx, :]
+                    self._encode_one_token(pos, token_ids[pos], logits, enc, demo, demo_rows)
+                    if speed_demo:
+                        overhead = time.perf_counter() - token_t0
+                        speed_rows.append({"pos": pos, "time": per_token_elapsed + overhead})
+                    pbar.update(1)
+
+        pbar.close()
+        return speed_rows, demo_rows
+
     def encode(
         self, 
         text, 
@@ -249,12 +446,57 @@ class LLM_Encoder(LLM_Codec_Base, _KVCacheMixin):
         coder = Coder(b=self.precision)
         enc = Encoder(coder, bit_writer)
         
-        cache_state = self._init_cache_state()
         speed_rows = []
         demo_rows = []
         
-        print(f"Encoding {len(token_ids)} tokens via '{self.strategy.upper()}' strategy...")
-        
+        mode_label = "PARALLEL" if self.parallel else "SEQUENTIAL"
+        print(f"Encoding {len(token_ids)} tokens via '{self.strategy.upper()}' strategy [{mode_label}]...")
+
+        # --- PARALLEL PATH ---
+        if self.parallel:
+            if self.strategy == "rolling":
+                print("Parallel mode is not supported for 'rolling'; falling back to sequential mode.")
+            
+            elif self.strategy == "block":
+                speed_rows, demo_rows = self._encode_parallel_block(token_ids, enc, demo, speed_demo)
+                
+                # [FIXED] Must finish encoder to flush buffered bits!
+                enc.finish()
+                bit_writer.flush(padbit=0)
+
+                if speed_demo and speed_rows:
+                    with open(speed_csv_path, "w", newline="") as f:
+                        writer = csv.DictWriter(f, fieldnames=["pos", "time"])
+                        writer.writeheader()
+                        writer.writerows(speed_rows)
+                if demo and demo_rows:
+                    with open(demo_csv_path, "w", newline="", encoding="utf-8") as f:
+                        writer = csv.DictWriter(f, fieldnames=demo_rows[0].keys())
+                        writer.writeheader()
+                        writer.writerows(demo_rows)
+                return bit_writer.getvalue()
+
+            elif self.strategy == "no_kv_cache":
+                speed_rows, demo_rows = self._encode_parallel_no_kv(token_ids, enc, demo, speed_demo)
+                
+                # [FIXED] Must finish encoder to flush buffered bits!
+                enc.finish()
+                bit_writer.flush(padbit=0)
+
+                if speed_demo and speed_rows:
+                    with open(speed_csv_path, "w", newline="") as f:
+                        writer = csv.DictWriter(f, fieldnames=["pos", "time"])
+                        writer.writeheader()
+                        writer.writerows(speed_rows)
+                if demo and demo_rows:
+                    with open(demo_csv_path, "w", newline="", encoding="utf-8") as f:
+                        writer = csv.DictWriter(f, fieldnames=demo_rows[0].keys())
+                        writer.writeheader()
+                        writer.writerows(demo_rows)
+                return bit_writer.getvalue()
+
+        # --- SEQUENTIAL / FALLBACK LOOP ---
+        cache_state = self._init_cache_state()
         if self.use_kv_cache:
             cache_state = self._hard_reset_cache_and_warmup([], 0, 0)
             cache_state["next_logits"] = self._get_logits(0, token_ids, cache_state)
@@ -269,7 +511,10 @@ class LLM_Encoder(LLM_Codec_Base, _KVCacheMixin):
                 )
 
             logits = self._get_logits(i, token_ids, cache_state)
-            probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()
+            
+            # [CRITICAL] Use the deterministic softmax from utils.py
+            # This handles the Cross-Device rounding logic
+            probs = deterministic_softmax(logits)
             
             # Demo Stats
             if demo:
@@ -341,12 +586,14 @@ class LLM_Decoder(LLM_Codec_Base, _KVCacheMixin):
                 )
             
             logits = self._get_logits(curr_idx, decoded_ids, cache_state)
-            probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()
+            
+            probs = deterministic_softmax(logits)
             
             if self.use_legacy_counts:
                 counts = probs_to_counts_legacy(probs, self.slots, self.dec_prec)
             else:
                 counts = probs_to_counts(probs, self.slots, self.dec_prec)
+                
             cum_desc = counts_to_cum_desc(counts)
             token_id = dec.decode_symbol(cum_desc)
             decoded_ids.append(token_id)
