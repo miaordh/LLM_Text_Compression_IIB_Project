@@ -18,11 +18,12 @@ from bitReadWrite import BitWriter, BitReader
 from arithmetic_coding import Coder
 from encoder import Encoder
 from decoder import Decoder
-from utils import counts_to_cum_desc, probs_to_counts, probs_to_counts_legacy, stabilize_probs
+from utils import counts_to_cum_desc, probs_to_counts, probs_to_counts_legacy
 
 class LLM_Codec_Base:
     def __init__(self, tokenizer, model, precision: int = 32, context_window: int = 2048, 
-                 margin: int = 128, strategy: str = "rolling", device: str = "auto", use_legacy_counts: bool = False):
+                 margin: int = 128, strategy: str = "rolling", device: str = "auto", use_legacy_counts: bool = False,
+                 slots: int = (1 << 24), logit_round_decimals: int = 2, prob_round_decimals: int = 5):
         self.tokenizer = tokenizer
         self.precision = precision
         self.context_window = context_window
@@ -47,10 +48,37 @@ class LLM_Codec_Base:
             self.model.resize_token_embeddings(len(self.tokenizer))
         self.eof_token_id = self.tokenizer.convert_tokens_to_ids("<EOF>")
 
-        self.slots = 1 << 24 
+        self.slots = int(slots)
         self.dec_prec = max(50, int(math.ceil(self.precision * math.log10(2))) + 10)
+        self.logit_round_decimals = int(logit_round_decimals)
+        self.prob_round_decimals = int(prob_round_decimals)
+
+    def _stable_probs(self, logits: torch.Tensor) -> np.ndarray:
+        logits_cpu = logits.detach().float().cpu()
+
+        if self.logit_round_decimals >= 0:
+            logit_scale = float(10 ** self.logit_round_decimals)
+            logits_cpu = torch.round(logits_cpu * logit_scale) / logit_scale
+
+        probs = torch.softmax(logits_cpu, dim=-1).numpy()
+
+        if self.prob_round_decimals >= 0:
+            probs = np.round(probs, self.prob_round_decimals)
+
+        probs_sum = probs.sum()
+        if probs_sum <= 0:
+            probs[:] = 1.0 / len(probs)
+        else:
+            probs /= probs_sum
+
+        return probs
 
 class _KVCacheMixin:
+    def _position_ids_from_mask(self, attention_mask: torch.Tensor) -> torch.Tensor:
+        position_ids = attention_mask.long().cumsum(-1) - 1
+        position_ids.masked_fill_(attention_mask == 0, 0)
+        return position_ids
+
     def _init_cache_state(self):
         return {"past_key_values": None, "next_logits": None, "cached_token_count": 0}
         
@@ -120,9 +148,15 @@ class _KVCacheMixin:
             # This causes "Path Divergence" inside the model kernels.
             # We must explicitely pass all-ones mask here to force the same kernel usage.
             attention_mask = torch.ones_like(input_ids)
+            position_ids = self._position_ids_from_mask(attention_mask)
             
             with torch.no_grad():
-                return self.model(input_ids, attention_mask=attention_mask, use_cache=False).logits[0, -1, :]
+                return self.model(
+                    input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    use_cache=False,
+                ).logits[0, -1, :]
 
         if cache_state["next_logits"] is not None: return cache_state["next_logits"]
         if current_idx == 0:
@@ -160,7 +194,7 @@ class LLM_Encoder(LLM_Codec_Base, _KVCacheMixin):
         self.parallel_batch_size = max(1, int(parallel_batch_size))
 
     def _encode_token(self, token_id, logits, enc):
-        probs = stabilize_probs(logits)
+        probs = self._stable_probs(logits)
         if self.use_legacy_counts:
             counts = probs_to_counts_legacy(probs, self.slots, self.dec_prec)
         else:
@@ -184,7 +218,13 @@ class LLM_Encoder(LLM_Codec_Base, _KVCacheMixin):
             if bos is not None:
                 dummy_in = torch.tensor([[bos]], device=self.device)
                 dummy_mask = torch.ones_like(dummy_in)
-                logits = self.model(dummy_in, attention_mask=dummy_mask).logits[0, -1, :]
+                dummy_pos = self._position_ids_from_mask(dummy_mask)
+                logits = self.model(
+                    dummy_in,
+                    attention_mask=dummy_mask,
+                    position_ids=dummy_pos,
+                    use_cache=False,
+                ).logits[0, -1, :]
             else:
                 logits = torch.zeros(self.tokenizer.vocab_size).to(self.device)
             self._encode_token(token_ids[0], logits, enc)
@@ -207,25 +247,57 @@ class LLM_Encoder(LLM_Codec_Base, _KVCacheMixin):
                          c = [bos] if bos is not None else [0]
                     contexts.append(c)
 
-                max_len = max(len(c) for c in contexts)
-                
-                input_ids = torch.full((len(batch_indices), max_len), pad_id, dtype=torch.long, device=self.device)
-                mask = torch.zeros((len(batch_indices), max_len), dtype=torch.long, device=self.device)
-                
-                for r, ctx in enumerate(contexts):
-                    l = len(ctx)
-                    # Right Padding
-                    input_ids[r, :l] = torch.tensor(ctx, device=self.device)
-                    mask[r, :l] = 1
-                
-                with torch.no_grad():
-                    out = self.model(input_ids, attention_mask=mask)
-                
-                for r, idx in enumerate(batch_indices):
-                    # For right padding, the last valid token is at index len(ctx) - 1
-                    valid_len = len(contexts[r])
-                    logits = out.logits[r, valid_len - 1, :]
-                    self._encode_token(token_ids[idx], logits, enc)
+                if self.device.type == "cpu":
+                    grouped_rows = {}
+                    for row_idx, ctx in enumerate(contexts):
+                        grouped_rows.setdefault(len(ctx), []).append(row_idx)
+
+                    for ctx_len, rows in grouped_rows.items():
+                        input_ids = torch.empty((len(rows), ctx_len), dtype=torch.long, device=self.device)
+                        for sub_row, row_idx in enumerate(rows):
+                            input_ids[sub_row] = torch.tensor(contexts[row_idx], dtype=torch.long, device=self.device)
+
+                        mask = torch.ones((len(rows), ctx_len), dtype=torch.long, device=self.device)
+                        position_ids = self._position_ids_from_mask(mask)
+
+                        with torch.no_grad():
+                            out = self.model(
+                                input_ids,
+                                attention_mask=mask,
+                                position_ids=position_ids,
+                                use_cache=False,
+                            )
+
+                        for sub_row, row_idx in enumerate(rows):
+                            idx = batch_indices[row_idx]
+                            logits = out.logits[sub_row, ctx_len - 1, :]
+                            self._encode_token(token_ids[idx], logits, enc)
+                else:
+                    max_len = max(len(c) for c in contexts)
+
+                    input_ids = torch.full((len(batch_indices), max_len), pad_id, dtype=torch.long, device=self.device)
+                    mask = torch.zeros((len(batch_indices), max_len), dtype=torch.long, device=self.device)
+
+                    for r, ctx in enumerate(contexts):
+                        l = len(ctx)
+                        # Right Padding
+                        input_ids[r, :l] = torch.tensor(ctx, dtype=torch.long, device=self.device)
+                        mask[r, :l] = 1
+
+                    position_ids = self._position_ids_from_mask(mask)
+
+                    with torch.no_grad():
+                        out = self.model(
+                            input_ids,
+                            attention_mask=mask,
+                            position_ids=position_ids,
+                            use_cache=False,
+                        )
+
+                    for r, idx in enumerate(batch_indices):
+                        valid_len = len(contexts[r])
+                        logits = out.logits[r, valid_len - 1, :]
+                        self._encode_token(token_ids[idx], logits, enc)
             
             enc.finish()
             bit_writer.flush()
@@ -254,7 +326,7 @@ class LLM_Encoder(LLM_Codec_Base, _KVCacheMixin):
         return bit_writer.getvalue()
 
 class LLM_Decoder(LLM_Codec_Base, _KVCacheMixin):
-    def decode(self, encoded_bytes, speed_demo=False, **kwargs):
+    def decode(self, encoded_bytes, speed_demo=False, max_decode_tokens: Optional[int] = None, **kwargs):
         dec = Decoder(Coder(b=self.precision), BitReader(encoded_bytes))
         decoded_ids = []
         cache = self._init_cache_state()
@@ -267,13 +339,17 @@ class LLM_Decoder(LLM_Codec_Base, _KVCacheMixin):
         pbar = tqdm(desc="Decoding")
         while token_id != self.eof_token_id:
             curr_idx = len(decoded_ids)
+            if max_decode_tokens is not None and curr_idx >= max_decode_tokens:
+                raise RuntimeError(
+                    f"Decoding exceeded max_decode_tokens={max_decode_tokens} before EOF. "
+                    "Likely incompatible probability stream (cross-device nondeterminism)."
+                )
             if self.strategy == "block" and curr_idx > 0 and curr_idx % self.block_stride == 0:
                 cache = self._hard_reset_cache_and_warmup(decoded_ids, curr_idx, self.margin)
             
             logits = self._get_logits(curr_idx, decoded_ids, cache)
             
-            # [FIX] Use same stabilizer
-            probs = stabilize_probs(logits)
+            probs = self._stable_probs(logits)
             
             if self.use_legacy_counts:
                 counts = probs_to_counts_legacy(probs, self.slots, self.dec_prec)

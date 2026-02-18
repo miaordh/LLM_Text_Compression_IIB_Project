@@ -9,3 +9,4 @@ arithmetic-coding-chapter.pdf
 *.jpeg
 build/
 *.egg-info/
+_safe_*.txt
