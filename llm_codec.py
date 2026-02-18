@@ -20,7 +20,7 @@ from bitReadWrite import BitWriter, BitReader
 from arithmetic_coding import Coder
 from encoder import Encoder
 from decoder import Decoder
-from utils import counts_to_cum_desc, probs_to_counts, probs_to_counts_legacy, deterministic_softmax
+from utils import counts_to_cum_desc, probs_to_counts, probs_to_counts_legacy, stabilize_probs
 
 class LLM_Codec_Base:
     """
@@ -274,7 +274,7 @@ class LLM_Encoder(LLM_Codec_Base, _KVCacheMixin):
     ):
         # [CHANGE] Use deterministic_softmax instead of standard softmax
         # This returns a Numpy array directly, ensuring Float64 precision was used for the sum.
-        probs = deterministic_softmax(logits, dim=-1)
+        probs = stabilize_probs(logits)
 
         if demo:
             p = float(probs[token_id])
@@ -514,7 +514,7 @@ class LLM_Encoder(LLM_Codec_Base, _KVCacheMixin):
             
             # [CRITICAL] Use the deterministic softmax from utils.py
             # This handles the Cross-Device rounding logic
-            probs = deterministic_softmax(logits)
+            probs = stabilize_probs(logits)
             
             # Demo Stats
             if demo:
@@ -587,7 +587,7 @@ class LLM_Decoder(LLM_Codec_Base, _KVCacheMixin):
             
             logits = self._get_logits(curr_idx, decoded_ids, cache_state)
             
-            probs = deterministic_softmax(logits)
+            probs = stabilize_probs(logits)
             
             if self.use_legacy_counts:
                 counts = probs_to_counts_legacy(probs, self.slots, self.dec_prec)

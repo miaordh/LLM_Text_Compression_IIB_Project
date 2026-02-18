@@ -7,3 +7,5 @@ arithmetic-coding-chapter.pdf
 *.png
 *.jpg
 *.jpeg
+build/
+*.egg-info/

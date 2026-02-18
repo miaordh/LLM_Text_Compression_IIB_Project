@@ -15,39 +15,25 @@ def counts_to_cumulative_ascending(counts: list[int]) -> list[int]:
 import torch
 import numpy as np
 
+try:
+    import exact_softmax_cpp
+    HAS_CPP_KERNEL = True
+    print("[Utils] Success: Loaded C++ Exact Softmax Kernel.")
+except ImportError:
+    HAS_CPP_KERNEL = False
+    print("[Utils] Warning: C++ Kernel not found. Re-run 'python setup.py install'.")
+
+
+
 def probs_to_counts(probs: np.ndarray, total: int, dec_prec: int = 0) -> List[int]:
-    """
-    Robust Vectorized Version.
-    1. Converts probabilities to integer counts.
-    2. GUARANTEES no zero counts (fixes 'R became zero' crash).
-    3. GUARANTEES sum equals 'total' exactly (deterministically).
-    """
-    # [Safety] Ensure input is 1D and Float64
     probs = np.atleast_1d(probs)
     ps = probs.astype(np.float64)
-    
-    # 1. Floor to get base counts
     counts = np.floor(ps * total).astype(np.int64)
-    
-    # 2. [CRITICAL FIX] Force Minimum Count of 1
-    # Arithmetic coding crashes if a valid symbol has 0 probability mass.
     counts[counts == 0] = 1
-    
-    # 3. Re-normalize sum to strictly match 'total'
     current_sum = np.sum(counts)
     diff = current_sum - total
-    
-    if diff == 0:
-        return counts.tolist()
-    
     if diff > 0:
-        # We added too much (by forcing 0 -> 1).
-        # We must subtract 'diff' from the highest frequency tokens.
-        
-        # Sort descending by count. 
-        # Use kind='stable' to ensure cross-platform determinism.
         indices = np.argsort(counts, kind='stable')[::-1]
-        
         for i in indices:
             if diff == 0: break
             if counts[i] > 1:
@@ -55,19 +41,14 @@ def probs_to_counts(probs: np.ndarray, total: int, dec_prec: int = 0) -> List[in
                 to_take = min(diff, can_take)
                 counts[i] -= to_take
                 diff -= to_take
-
     elif diff < 0:
-        # Floor caused sum to be too low.
-        # Add to the tokens with largest rounding error.
         errors = (ps * total) - counts
         indices = np.argsort(errors, kind='stable')[::-1]
-        
         to_add = -diff
         for i in indices:
             if to_add == 0: break
             counts[i] += 1
             to_add -= 1
-            
     return counts.tolist()
 
 def probs_to_counts_legacy(probs: List[float], total: int, dec_prec: int = 200) -> List[int]:
@@ -239,6 +220,36 @@ def stabilize_logits(logits, decimals=5):
     probs = probs / probs.sum()
     return probs
 
+def stabilize_probs(logits: torch.Tensor) -> np.ndarray:
+    """
+    Computes Deterministic Probabilities.
+    Standardized to 2 decimal places of Logit Precision.
+    """
+    if HAS_CPP_KERNEL:
+        # C++ Kernel (2 Decimals)
+        probs_tensor = exact_softmax_cpp.forward(logits)
+        return probs_tensor.numpy()
+    else:
+        # Python Fallback (2 Decimals)
+        # 1. Move to CPU
+        logits_cpu = logits.float().cpu()
+        
+        # 2. Aggressive Logit Rounding (100.0 = 2 decimals)
+        PRECISION_SCALE = 100.0
+        logits_cpu = torch.round(logits_cpu * PRECISION_SCALE) / PRECISION_SCALE
+        
+        # 3. Softmax
+        probs = torch.softmax(logits_cpu, dim=-1)
+        probs = probs.detach().numpy()
+        
+        # 4. Output Rounding (Cleanup)
+        probs = np.round(probs, 5)
+        
+        # 5. Renormalize
+        s = probs.sum()
+        if s == 0: probs[:] = 1.0 / len(probs)
+        else: probs /= s
+        return probs
 # In utils.py
 
 import torch
