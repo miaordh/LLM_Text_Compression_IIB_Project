@@ -192,7 +192,7 @@ class LLM_Encode_KV_Cache(_KVCacheMixin):
             
             # 1. Get Logits
             # Note: For i > 0, this returns logits cached from the previous loop's _advance_cache
-            logits = self._ensure_next_logits(i, token_ids, cache_state).detach()
+            logits = self._ensure_next_logits(i, token_ids, cache_state)
             
             # 2. Probability & Arithmetic Coding
             probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()
@@ -281,7 +281,7 @@ class LLM_Decode_KV_Cache(_KVCacheMixin):
             current_idx = len(decoded_token_ids)
 
             # 1. Get Logits
-            logits = self._ensure_next_logits(current_idx, decoded_token_ids, cache_state).detach()
+            logits = self._ensure_next_logits(current_idx, decoded_token_ids, cache_state)
             
             # 2. Probability & Arithmetic Decoding
             probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()

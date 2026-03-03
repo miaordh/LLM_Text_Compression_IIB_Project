@@ -35,7 +35,7 @@ class Coder:
                 self.L -= self.lb
             # shift left 1 bit, keep within b bits
             self.L = (self.L << 1) & self.mask
-            self.R = (self.R << 1) & self.mask
+            self.R = self.R << 1
             if self.R == 0:
                 raise RuntimeError("_output_bits: R became zero")
 
@@ -60,7 +60,7 @@ class Coder:
                 self.L -= self.lb
                 self.D -= self.lb
             self.L = (self.L << 1) & self.mask
-            self.R = (self.R << 1) & self.mask
+            self.R = self.R << 1
             # bring in next bit
             self.D = ((self.D << 1) & self.mask) + self.input.read_bit()
             if self.R == 0:
@@ -96,29 +96,29 @@ class Coder:
                 self._output_all(1)
                 if self.L < self.hb:
                     # adjust R so range equals hb - L (in original loop)
-                    self.R = (self.R - (self.hb - self.L)) & self.mask
+                    self.R = self.R - (self.hb - self.L)
                     self.L = 0
                 else:
                     self.L = (self.L - self.hb) & self.mask
             else:
                 self._output_all(0)
                 if self.L + self.R > self.hb:
-                    self.R = (self.hb - self.L) & self.mask
+                    self.R = self.hb - self.L
             if self.R == 0:
                 raise RuntimeError("finish_encode: R==0")
             if self.R == self.hb:
                 break
             self.L = (self.L << 1) & self.mask
-            self.R = (self.R << 1) & self.mask
+            self.R = self.R << 1
 
     def set_interval_and_renorm_encode(self, new_low: int, new_high: int) -> None:
         """Set absolute interval [new_low, new_high] and renormalise for encoder."""
         self.L = new_low & self.mask
-        self.R = ((new_high - new_low + 1) & self.mask)
+        self.R = (new_high - new_low + 1)
         self._output_bits()
 
     def set_interval_and_renorm_decode(self, new_low: int, new_high: int) -> None:
         """Set absolute interval [new_low, new_high] and renormalise for decoder."""
         self.L = new_low & self.mask
-        self.R = ((new_high - new_low + 1) & self.mask)
+        self.R = (new_high - new_low + 1)
         self._discard_bits()

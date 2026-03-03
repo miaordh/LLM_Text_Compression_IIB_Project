@@ -82,11 +82,14 @@ def probs_to_counts_legacy(probs: List[float], total: int, dec_prec: int = 200) 
         fracs = [scaled[i] - Decimal(floors[i]) for i in range(n)]
 
         pos_idx = [i for i, p in enumerate(dec_probs) if p > 0]
-        if len(pos_idx) > total:
-            raise ValueError("total too small to give each positive-prob symbol one count")
-        min_req = [0] * n
-        for i in pos_idx:
-            min_req[i] = 1
+        if total >= n:
+            min_req = [1] * n
+        else:
+            if len(pos_idx) > total:
+                raise ValueError("total too small to give each positive-prob symbol one count")
+            min_req = [0] * n
+            for i in pos_idx:
+                min_req[i] = 1
 
         for i in range(n):
             if floors[i] < min_req[i]:
@@ -217,13 +220,13 @@ def stabilize_probs(logits: torch.Tensor) -> np.ndarray:
     Computes Deterministic Probabilities.
     Standardized to 2 decimal places of Logit Precision.
     """
-    logits_cpu = logits.float().cpu()
+    logits_work = logits.float()
 
     PRECISION_SCALE = 100.0
-    logits_cpu = torch.round(logits_cpu * PRECISION_SCALE) / PRECISION_SCALE
+    logits_work = torch.round(logits_work * PRECISION_SCALE) / PRECISION_SCALE
 
-    probs = torch.softmax(logits_cpu, dim=-1)
-    probs = probs.detach().numpy()
+    probs = torch.softmax(logits_work, dim=-1)
+    probs = probs.detach().cpu().numpy()
 
     probs = np.round(probs, 5)
 

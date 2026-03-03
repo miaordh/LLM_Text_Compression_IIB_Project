@@ -24,8 +24,11 @@ class DeterministicCodecConfig:
     determinism_mode: str = "batch_invariant"
     precision: int = 32
     slots: int = (1 << 24)
-    use_legacy_counts: bool = True
+    use_legacy_counts: bool = False
     use_kv_cache: bool = False
+    quant: bool = True
+    logit_round_decimals: int = 2
+    prob_round_decimals: int = 5
     seed: int = 0
     patch_linear: bool = True
     patch_rmsnorm: bool = True
@@ -109,9 +112,17 @@ class DeterministicLLMCodec:
         return out.logits[0, -1, :]
 
     def _probs(self, logits: torch.Tensor) -> np.ndarray:
-        logits_2d = logits.view(1, -1)
-        probs_t = torch.exp(self._log_softmax_fn(logits_2d, dim=-1))[0].detach().cpu().to(torch.float64)
-        probs = probs_t.numpy()
+        logits_2d = logits.view(1, -1).detach().float()
+
+        if self.config.quant and self.config.logit_round_decimals >= 0:
+            logit_scale = float(10 ** self.config.logit_round_decimals)
+            logits_2d = torch.round(logits_2d * logit_scale) / logit_scale
+
+        probs_t = torch.exp(self._log_softmax_fn(logits_2d, dim=-1))[0].detach().to(torch.float64)
+        probs = probs_t.cpu().numpy()
+
+        if self.config.quant and self.config.prob_round_decimals >= 0:
+            probs = np.round(probs, self.config.prob_round_decimals)
 
         probs_sum = probs.sum()
         if probs_sum <= 0:

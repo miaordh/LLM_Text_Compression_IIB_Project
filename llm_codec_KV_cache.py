@@ -134,7 +134,7 @@ class LLM_Encode_KV_Cache(_KVCacheMixin):
             if self._is_block_start(i):
                 cache_state = self._reset_cache(cache_state)
 
-            logits = self._ensure_next_logits(i, token_ids, cache_state).detach()
+            logits = self._ensure_next_logits(i, token_ids, cache_state)
             probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()
             vocab_size = len(probs)
             counts = probs_to_counts(probs=probs, total=slots, dec_prec=dec_prec)
@@ -208,7 +208,7 @@ class LLM_Decode_KV_Cache(_KVCacheMixin):
             if self._is_block_start(position):
                 cache_state = self._reset_cache(cache_state)
 
-            logits = self._ensure_next_logits(position, decoded_token_ids, cache_state).detach()
+            logits = self._ensure_next_logits(position, decoded_token_ids, cache_state)
             probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()
             vocab_size = len(probs)
             counts = probs_to_counts(probs=probs, total=slots, dec_prec=dec_prec)

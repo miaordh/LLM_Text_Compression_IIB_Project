@@ -23,7 +23,8 @@ from utils import counts_to_cum_desc, probs_to_counts, probs_to_counts_legacy
 class LLM_Codec_Base:
     def __init__(self, tokenizer, model, precision: int = 32, context_window: int = 2048, 
                  margin: int = 128, strategy: str = "rolling", device: str = "auto", use_legacy_counts: bool = False,
-                 slots: int = (1 << 24), logit_round_decimals: int = 2, prob_round_decimals: int = 5):
+                 slots: int = (1 << 24), logit_round_decimals: int = 2, prob_round_decimals: int = 5,
+                 quant: bool = True):
         self.tokenizer = tokenizer
         self.precision = precision
         self.context_window = context_window
@@ -50,19 +51,20 @@ class LLM_Codec_Base:
 
         self.slots = int(slots)
         self.dec_prec = max(50, int(math.ceil(self.precision * math.log10(2))) + 10)
+        self.quant = bool(quant)
         self.logit_round_decimals = int(logit_round_decimals)
         self.prob_round_decimals = int(prob_round_decimals)
 
     def _stable_probs(self, logits: torch.Tensor) -> np.ndarray:
-        logits_cpu = logits.detach().float().cpu()
+        logits_work = logits.detach().float()
 
-        if self.logit_round_decimals >= 0:
+        if self.quant and self.logit_round_decimals >= 0:
             logit_scale = float(10 ** self.logit_round_decimals)
-            logits_cpu = torch.round(logits_cpu * logit_scale) / logit_scale
+            logits_work = torch.round(logits_work * logit_scale) / logit_scale
 
-        probs = torch.softmax(logits_cpu, dim=-1).numpy()
+        probs = torch.softmax(logits_work, dim=-1).detach().cpu().numpy()
 
-        if self.prob_round_decimals >= 0:
+        if self.quant and self.prob_round_decimals >= 0:
             probs = np.round(probs, self.prob_round_decimals)
 
         probs_sum = probs.sum()
