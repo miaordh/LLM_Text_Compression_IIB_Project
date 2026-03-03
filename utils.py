@@ -15,14 +15,6 @@ def counts_to_cumulative_ascending(counts: list[int]) -> list[int]:
 import torch
 import numpy as np
 
-try:
-    import exact_softmax_cpp
-    HAS_CPP_KERNEL = True
-    print("[Utils] Success: Loaded C++ Exact Softmax Kernel.")
-except ImportError:
-    HAS_CPP_KERNEL = False
-    print("[Utils] Warning: C++ Kernel not found. Re-run 'python setup.py install'.")
-
 
 
 def probs_to_counts(probs: np.ndarray, total: int, dec_prec: int = 0) -> List[int]:
@@ -225,54 +217,43 @@ def stabilize_probs(logits: torch.Tensor) -> np.ndarray:
     Computes Deterministic Probabilities.
     Standardized to 2 decimal places of Logit Precision.
     """
-    if HAS_CPP_KERNEL:
-        # C++ Kernel (2 Decimals)
-        probs_tensor = exact_softmax_cpp.forward(logits)
-        return probs_tensor.numpy()
+    logits_cpu = logits.float().cpu()
+
+    PRECISION_SCALE = 100.0
+    logits_cpu = torch.round(logits_cpu * PRECISION_SCALE) / PRECISION_SCALE
+
+    probs = torch.softmax(logits_cpu, dim=-1)
+    probs = probs.detach().numpy()
+
+    probs = np.round(probs, 5)
+
+    s = probs.sum()
+    if s == 0:
+        probs[:] = 1.0 / len(probs)
     else:
-        # Python Fallback (2 Decimals)
-        # 1. Move to CPU
-        logits_cpu = logits.float().cpu()
-        
-        # 2. Aggressive Logit Rounding (100.0 = 2 decimals)
-        PRECISION_SCALE = 100.0
-        logits_cpu = torch.round(logits_cpu * PRECISION_SCALE) / PRECISION_SCALE
-        
-        # 3. Softmax
-        probs = torch.softmax(logits_cpu, dim=-1)
-        probs = probs.detach().numpy()
-        
-        # 4. Output Rounding (Cleanup)
-        probs = np.round(probs, 5)
-        
-        # 5. Renormalize
-        s = probs.sum()
-        if s == 0: probs[:] = 1.0 / len(probs)
-        else: probs /= s
-        return probs
+        probs /= s
+    return probs
 # In utils.py
 
-import torch
-
-def deterministic_softmax(logits, dim=-1, decimals=6):
+def deterministic_softmax(logits, dim=-1, decimals=6, force_cpu=False):
     """
-    Computes Softmax with strict Cross-Device Determinism (CPU vs MPS).
+    Computes quantized softmax with optional CPU forcing.
     
-    1. Moves to CPU.
-    2. [NEW] Rounds LOGITS to eliminate hardware matmul noise.
+    1. Optionally moves to CPU when force_cpu=True.
+    2. Rounds LOGITS to reduce tiny numerical noise.
     3. Upcasts to Float64.
     4. Rounds PROBS for final alignment.
     """
-    # 1. Move to CPU immediately
-    # We cannot trust MPS math to match CPU math perfectly.
-    logits_cpu = logits.detach().cpu()
+    logits_work = logits.detach()
+    if force_cpu:
+        logits_work = logits_work.cpu()
     
     # 2. [THE NUCLEAR FIX] Quantize Logits
     # CPU: 12.3456781  vs  MPS: 12.3456789
     # Rounding to 4 decimals snaps both to 12.3457
     # This sacrifices tiny precision for absolute determinism.
     logit_precision = 10000.0  # 4 decimal places
-    logits_quant = torch.round(logits_cpu * logit_precision) / logit_precision
+    logits_quant = torch.round(logits_work * logit_precision) / logit_precision
     
     # 3. Upcast to Float64 for the Softmax Summation
     logits_64 = logits_quant.to(dtype=torch.float64)
@@ -284,7 +265,7 @@ def deterministic_softmax(logits, dim=-1, decimals=6):
     probs_64 = exps / sum_exps
     
     # 5. Convert to Numpy
-    probs = probs_64.numpy()
+    probs = probs_64.detach().cpu().numpy()
     
     # 6. Final Probability Rounding (Snaps '0.3333331' to '0.333333')
     probs = np.round(probs, decimals)

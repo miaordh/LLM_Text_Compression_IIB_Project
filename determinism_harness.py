@@ -11,12 +11,6 @@ def main():
     parser.add_argument("--text", required=True, help="Text to encode/decode")
     parser.add_argument("--encode-device", default="cpu", help="Device used for encoding")
     parser.add_argument("--decode-device", default="mps", help="Device used for decoding")
-    parser.add_argument(
-        "--determinism-mode",
-        default="strict_cpu",
-        choices=["strict_cpu", "gpu_best_effort"],
-        help="strict_cpu = strongest determinism; gpu_best_effort = faster, weaker cross-platform guarantee",
-    )
     parser.add_argument("--precision", type=int, default=32)
     parser.add_argument("--slots", type=int, default=(1 << 24))
     args = parser.parse_args()
@@ -25,7 +19,6 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(args.model)
 
     cfg = DeterministicCodecConfig(
-        determinism_mode=args.determinism_mode,
         precision=args.precision,
         slots=args.slots,
         use_legacy_counts=True,

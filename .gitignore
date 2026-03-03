@@ -10,3 +10,6 @@ arithmetic-coding-chapter.pdf
 build/
 *.egg-info/
 _safe_*.txt
+batch_invariant_ops/
+.venv/
+__pycache__/

@@ -1,57 +1,38 @@
-# Deterministic Kernel Path (Experimental)
+# Deterministic Kernel Plan (Current Status)
 
-This path is isolated from the original codec implementation.
+## Summary
 
-## Added files
+The project now uses `batch_invariant_ops` for deterministic/batch-invariant behavior in the standalone deterministic codec path.
 
-- `deterministic_ops.cpp`: CPU float64 deterministic kernels for:
-  - softmax
-  - matmul
-  - RMSNorm
-- `setup_deterministic_ops.py`: build script for `deterministic_ops_cpp`.
-- `deterministic_runtime.py`: deterministic runtime configuration + monkeypatch layer wrappers.
-- `llm_codec_deterministic.py`: standalone codec using deterministic runtime and kernels.
-- `vllm_deterministic_backend.py`: optional vLLM constructor with deterministic-friendly defaults.
-- `determinism_harness.py`: CPU->MPS roundtrip checker.
+## Kept files
 
-## Why this addresses paper sources
+- `llm_codec_deterministic.py`: deterministic codec, now using `batch_invariant_ops` instead of custom runtime/kernels.
+- `determinism_harness.py`: encode/decode roundtrip harness.
+- `batch_invariant_ops/`: external implementation integrated in this workspace.
 
-- **Batch invariance**: codec runs a fixed single-request path (batch size 1) with explicit masks and positions.
-- **RMSNorm reduction variance**: RMSNorm can be routed through a deterministic CPU float64 kernel.
-- **Matmul split-K variance**: linear layers can be routed through deterministic CPU float64 matmul.
-- **Attention kernel path variance**: SDPA can be replaced by a deterministic eager implementation.
-- **KV-cache boundary variance**: default uses `use_kv_cache=False` to remove dynamic cache split behavior.
+## Removed legacy files
 
-## Build and use
+The following files were intentionally removed during cleanup because they belonged to the previous custom kernel implementation:
 
-1. Build extension:
+- `deterministic_ops.cpp`
+- `deterministic_runtime.py`
+- `exact_softmax.cpp`
+- `setup_deterministic_ops.py`
+- `vllm_deterministic_backend.py`
+- `setup.py`
 
-```bash
-python setup_deterministic_ops.py install
-```
+## Implications
 
-2. Run harness:
+- Any setup instructions referring to building local C++ extensions are obsolete.
+- Any references to `strict_cpu` / `gpu_best_effort` modes are obsolete.
+- Deterministic path selection is now capability-based inside `llm_codec_deterministic.py`.
+
+## Run harness
 
 ```bash
 python determinism_harness.py \
   --model google/gemma-2-2b \
   --text "Determinism test." \
-  --determinism-mode strict_cpu \
-  --encode-device cpu \
-  --decode-device mps
+  --encode-device cuda \
+  --decode-device cpu
 ```
-
-## Determinism modes
-
-- `strict_cpu` (default)
-  - Patches Linear/RMSNorm/Attention to deterministic CPU reduction paths.
-  - Strongest cross-platform reproducibility, slowest runtime.
-- `gpu_best_effort`
-  - Keeps model ops on GPU where possible, still enables torch deterministic settings.
-  - Faster runtime, but weaker cross-platform guarantee (CPU↔MPS/CUDA may still diverge).
-
-## Notes
-
-- This is intentionally slow because it prioritizes deterministic reductions over speed.
-- The Python fallback in `deterministic_runtime.py` works without compiling C++ extension.
-- vLLM integration is optional and currently limited to deterministic engine setup scaffolding.

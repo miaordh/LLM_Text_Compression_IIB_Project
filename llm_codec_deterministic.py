@@ -1,4 +1,5 @@
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional
 
@@ -10,13 +11,17 @@ from arithmetic_coding import Coder
 from bitReadWrite import BitReader, BitWriter
 from decoder import Decoder
 from encoder import Encoder
-from deterministic_runtime import DeterministicKernelConfig, deterministic_kernel_context, deterministic_softmax
 from utils import counts_to_cum_desc, probs_to_counts, probs_to_counts_legacy
+
+try:
+    from batch_invariant_ops import set_batch_invariant_mode, log_softmax
+except ImportError:
+    from batch_invariant_ops.batch_invariant_ops import set_batch_invariant_mode, log_softmax
 
 
 @dataclass
 class DeterministicCodecConfig:
-    determinism_mode: str = "strict_cpu"
+    determinism_mode: str = "batch_invariant"
     precision: int = 32
     slots: int = (1 << 24)
     use_legacy_counts: bool = True
@@ -31,9 +36,6 @@ class DeterministicLLMCodec:
     def __init__(self, tokenizer, model, device: str = "auto", config: Optional[DeterministicCodecConfig] = None):
         self.tokenizer = tokenizer
         self.config = config or DeterministicCodecConfig()
-
-        if self.config.determinism_mode not in {"strict_cpu", "gpu_best_effort"}:
-            raise ValueError("determinism_mode must be 'strict_cpu' or 'gpu_best_effort'")
 
         if device == "auto":
             if torch.cuda.is_available():
@@ -60,15 +62,24 @@ class DeterministicLLMCodec:
         except Exception:
             pass
 
-        self.kernel_config = DeterministicKernelConfig(
-            mode=self.config.determinism_mode,
-            seed=self.config.seed,
-            patch_linear=self.config.patch_linear,
-            patch_rmsnorm=self.config.patch_rmsnorm,
-            patch_attention=self.config.patch_attention,
-            force_cpu_kernels=(self.config.determinism_mode == "strict_cpu"),
-            single_thread_cpu=(self.config.determinism_mode == "strict_cpu"),
-        )
+        self._batch_invariant_enabled = True
+        self._batch_invariant_ctx = set_batch_invariant_mode
+        self._log_softmax_fn = log_softmax
+        self._detect_batch_invariant_capability()
+
+    def _detect_batch_invariant_capability(self):
+        try:
+            sample = torch.zeros((1, 2), dtype=torch.float32, device=self.device)
+            with self._batch_invariant_ctx(True):
+                _ = self._log_softmax_fn(sample, dim=-1)
+        except Exception:
+            self._batch_invariant_enabled = False
+            self._log_softmax_fn = torch.log_softmax
+
+    def _invariant_context(self):
+        if self._batch_invariant_enabled:
+            return self._batch_invariant_ctx(True)
+        return nullcontext()
 
     @staticmethod
     def _position_ids_from_mask(attention_mask: torch.Tensor) -> torch.Tensor:
@@ -98,7 +109,8 @@ class DeterministicLLMCodec:
         return out.logits[0, -1, :]
 
     def _probs(self, logits: torch.Tensor) -> np.ndarray:
-        probs_t = deterministic_softmax(logits, dim=-1, mode=self.config.determinism_mode).detach().cpu().to(torch.float64)
+        logits_2d = logits.view(1, -1)
+        probs_t = torch.exp(self._log_softmax_fn(logits_2d, dim=-1))[0].detach().cpu().to(torch.float64)
         probs = probs_t.numpy()
 
         probs_sum = probs.sum()
@@ -119,7 +131,7 @@ class DeterministicLLMCodec:
         writer = BitWriter()
         enc = Encoder(Coder(b=self.config.precision), writer)
 
-        with deterministic_kernel_context(self.model, self.kernel_config):
+        with self._invariant_context():
             for idx, token_id in tqdm(enumerate(token_ids), total=len(token_ids), desc="Deterministic Encode"):
                 prefix = token_ids[:idx]
                 logits = self._logits_for_prefix(prefix)
@@ -135,7 +147,7 @@ class DeterministicLLMCodec:
         dec = Decoder(Coder(b=self.config.precision), BitReader(encoded_bytes))
         decoded_ids = []
 
-        with deterministic_kernel_context(self.model, self.kernel_config):
+        with self._invariant_context():
             token_id = None
             while token_id != self.eof_token_id:
                 idx = len(decoded_ids)
