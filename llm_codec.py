@@ -269,7 +269,7 @@ class LLM_Encoder(LLM_Codec_Base, _KVCacheMixin):
                 )
 
             logits = self._get_logits(i, token_ids, cache_state)
-            probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()
+            probs = torch.softmax(logits, dim=-1).detach().to(torch.float32).cpu().numpy()
             
             # Demo Stats
             if demo:
@@ -341,7 +341,7 @@ class LLM_Decoder(LLM_Codec_Base, _KVCacheMixin):
                 )
             
             logits = self._get_logits(curr_idx, decoded_ids, cache_state)
-            probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()
+            probs = torch.softmax(logits, dim=-1).detach().to(torch.float32).cpu().numpy()
             
             if self.use_legacy_counts:
                 counts = probs_to_counts_legacy(probs, self.slots, self.dec_prec)

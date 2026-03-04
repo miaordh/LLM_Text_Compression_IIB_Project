@@ -7,3 +7,9 @@ arithmetic-coding-chapter.pdf
 *.png
 *.jpg
 *.jpeg
+__pycache__/
+.venv/
+batch_invariant_ops/
+build/
+*.egg-info/
+_safe*.txt
