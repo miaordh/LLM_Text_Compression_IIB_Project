@@ -195,7 +195,7 @@ class LLM_Encode_KV_Cache(_KVCacheMixin):
             logits = self._ensure_next_logits(i, token_ids, cache_state).detach()
             
             # 2. Probability & Arithmetic Coding
-            probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()
+            probs = torch.softmax(logits, dim=-1).detach().to(torch.float32).cpu().numpy()
             counts = probs_to_counts(probs=probs, total=slots, dec_prec=dec_prec)
             cum_desc = counts_to_cum_desc(counts)
             enc.encode_symbol(token_id, cum_desc)
@@ -284,7 +284,7 @@ class LLM_Decode_KV_Cache(_KVCacheMixin):
             logits = self._ensure_next_logits(current_idx, decoded_token_ids, cache_state).detach()
             
             # 2. Probability & Arithmetic Decoding
-            probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()
+            probs = torch.softmax(logits, dim=-1).detach().to(torch.float32).cpu().numpy()
             counts = probs_to_counts(probs=probs, total=slots, dec_prec=dec_prec)
             cum_desc = counts_to_cum_desc(counts)
             token_id = dec.decode_symbol(cum_desc)

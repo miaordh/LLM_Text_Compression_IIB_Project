@@ -16,55 +16,58 @@ import torch
 import numpy as np
 
 def probs_to_counts(probs: np.ndarray, total: int, dec_prec: int = 0) -> List[int]:
-    """
-    Fast Vectorized Version.
-    Converts probabilities to integer counts summing EXACTLY to total.
-    """
-    # 1. Convert to simple Float64 numpy array (Avoid Decimal for speed)
-    # The precision of Float64 is enough for compression if we handle the sum carefully.
-    ps = probs.astype(np.float64)
-    
-    # 2. Scale up to integers
-    # counts = floor(p * total)
+    """Convert probabilities to integer counts summing exactly to total."""
+    if total <= 0:
+        raise ValueError("total must be positive")
+
+    ps = np.atleast_1d(probs).astype(np.float64)
+    if ps.ndim != 1:
+        ps = ps.reshape(-1)
+
+    ps = np.nan_to_num(ps, nan=0.0, posinf=0.0, neginf=0.0)
+    ps = np.clip(ps, 0.0, None)
+
+    s = ps.sum()
+    if s <= 0:
+        ps = np.full_like(ps, 1.0 / len(ps), dtype=np.float64)
+    else:
+        ps = ps / s
+
     counts = np.floor(ps * total).astype(np.int64)
-    
-    # 3. Handle the "Remainder" (The rounding error)
-    # The sum of floors will be less than total. We must distribute the difference.
-    current_sum = counts.sum()
-    remainder = total - current_sum
-    
-    if remainder > 0:
-        # Distribute the remainder to the tokens with the largest rounding errors
-        # logic: (p*total) - floor(p*total)
+
+    if total >= len(counts):
+        min_req = np.ones_like(counts)
+    else:
+        min_req = (ps > 0).astype(np.int64)
+
+    counts = np.maximum(counts, min_req)
+
+    diff = int(counts.sum() - total)
+
+    if diff > 0:
+        order = np.argsort(counts, kind="stable")[::-1]
+        for idx in order:
+            if diff == 0:
+                break
+            spare = int(counts[idx] - min_req[idx])
+            if spare <= 0:
+                continue
+            take = min(spare, diff)
+            counts[idx] -= take
+            diff -= take
+    elif diff < 0:
         errors = (ps * total) - counts
-        
-        # Get indices of the largest errors (we only need 'remainder' of them)
-        # argpartition is O(N), much faster than sort O(N log N)
-        if remainder > len(counts):
-             # Rare edge case: add 1 to everyone, then fix remainder
-             counts += (remainder // len(counts))
-             remainder %= len(counts)
-        
-        # Add 1 to the 'remainder' indices with highest fractional parts
-        indices = np.argpartition(errors, -remainder)[-remainder:]
-        counts[indices] += 1
-        
-    # 4. Safety Check: Ensure no count is 0 if probability was > 0
-    # (Optional: In extremely rare cases, a tiny prob might floor to 0. 
-    #  We steal 1 from the largest count to give to the zero-count.)
-    zeros = (counts == 0) & (ps > 0)
-    if zeros.any():
-        zero_indices = np.where(zeros)[0]
-        # Find the richest bucket to tax
-        rich_index = np.argmax(counts)
-        for idx in zero_indices:
-            if counts[rich_index] > 1:
-                counts[rich_index] -= 1
-                counts[idx] = 1
-            else:
-                # If even the richest bucket is poor, we have a crisis (vocab too big for 'total')
-                # But usually 'total' (2^16 or 2^32) >> vocab size
-                pass 
+        order = np.argsort(errors, kind="stable")[::-1]
+        to_add = -diff
+        for idx in order:
+            if to_add == 0:
+                break
+            counts[idx] += 1
+            to_add -= 1
+
+    final_sum = int(counts.sum())
+    if final_sum != total:
+        raise RuntimeError(f"counts sum {final_sum} != total {total}")
 
     return counts.tolist()
 
