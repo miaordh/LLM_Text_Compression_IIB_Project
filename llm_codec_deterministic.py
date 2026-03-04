@@ -130,7 +130,13 @@ class DeterministicLLMCodec:
 
     def _probs(self, logits: torch.Tensor) -> np.ndarray:
         if self.config.quant:
-            logits_np = logits.detach().to(dtype=torch.float64).cpu().numpy().reshape(-1)
+            logits_np = (
+                logits.detach()
+                .to(device="cpu", dtype=torch.float32)
+                .numpy()
+                .reshape(-1)
+                .astype(np.float64, copy=False)
+            )
 
             max_logit = float(np.max(logits_np))
             exp_shifted = np.exp(logits_np - max_logit)
@@ -158,8 +164,8 @@ class DeterministicLLMCodec:
             return probs
 
         logits_2d = logits.view(1, -1).detach().to(dtype=torch.float32)
-        probs_t = torch.exp(self._log_softmax_fn(logits_2d, dim=-1))[0].to(dtype=torch.float64)
-        probs = probs_t.detach().cpu().numpy()
+        probs_t = torch.exp(self._log_softmax_fn(logits_2d, dim=-1))[0]
+        probs = probs_t.detach().cpu().numpy().astype(np.float64, copy=False)
 
         probs_sum = probs.sum()
         if probs_sum <= 0:
