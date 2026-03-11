@@ -1,6 +1,9 @@
 import json
+import os
+import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import List
 
@@ -32,14 +35,19 @@ FILE_ENCODING_OVERRIDES = {
 }
 
 KEEP_ARTIFACTS = False
-PHASE_TIMEOUT_SECONDS = 18000 # 0 disables timeout
+PHASE_TIMEOUT_SECONDS = 10800 # 0 disables timeout
 STOP_ON_FILE_ERROR = True
+
+# Parallel-run safety:
+# - RUN_TAG = None -> auto-generate unique tag per run (recommended)
+# - RUN_TAG = "mytag" -> fixed tag (you manage collisions)
+RUN_TAG = None
 
 # File selection for cantrbry:
 # - None: run nothing from CANTRBRY_DIR
 # - "all": run every file under CANTRBRY_DIR
 # - list[str]: explicit relative filenames under CANTRBRY_DIR
-CANTRBRY_FILE_SELECTION = ["cp.html"]
+CANTRBRY_FILE_SELECTION = ["fields.c"]
 
 # File selection for project root text files:
 # - None: run nothing from project root
@@ -51,6 +59,17 @@ CANTRBRY_DIR = Path("cantrbry")
 OUTPUT_CSV = Path("deterministic_roundtrip_results.csv")
 WORKER_SCRIPT = Path("deterministic_roundtrip_worker.py")
 CONFIG_PATH = Path("deterministic_roundtrip_config.json")
+ARTIFACT_ROOT_BASE = Path(".roundtrip_artifacts")
+
+
+def _resolve_run_tag() -> str:
+    if RUN_TAG:
+        return str(RUN_TAG)
+    return f"{socket.gethostname()}_{os.getpid()}_{time.time_ns()}"
+
+
+def _with_tag(path: Path, run_tag: str) -> Path:
+    return path.with_name(f"{path.stem}_{run_tag}{path.suffix}")
 
 
 def _select_files(base_dir: Path, selection, txt_only: bool = False) -> List[Path]:
@@ -79,6 +98,7 @@ def _select_files(base_dir: Path, selection, txt_only: bool = False) -> List[Pat
 
 def main():
     project_root = Path(__file__).resolve().parent
+    run_tag = _resolve_run_tag()
     cantrbry_dir = (project_root / CANTRBRY_DIR).resolve()
     worker = (project_root / WORKER_SCRIPT).resolve()
 
@@ -121,13 +141,18 @@ def main():
         "stop_on_file_error": STOP_ON_FILE_ERROR,
     }
 
+    output_csv_path = (project_root / _with_tag(OUTPUT_CSV, run_tag)).resolve()
+    config_path = (project_root / _with_tag(CONFIG_PATH, run_tag)).resolve()
+    artifact_root = (project_root / ARTIFACT_ROOT_BASE / run_tag).resolve()
+
     config = {
         "files": [str(p) for p in files],
         "settings": settings,
-        "output_csv": str((project_root / OUTPUT_CSV).resolve()),
+        "output_csv": str(output_csv_path),
+        "artifact_root": str(artifact_root),
+        "run_tag": run_tag,
     }
 
-    config_path = (project_root / CONFIG_PATH).resolve()
     config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
     cmd = [
@@ -143,7 +168,10 @@ def main():
     if completed.returncode != 0:
         raise RuntimeError(f"Worker failed with exit code {completed.returncode}")
 
-    print(f"Round-trip results written to: {(project_root / OUTPUT_CSV).resolve()}")
+    print(f"Run tag: {run_tag}")
+    print(f"Round-trip results written to: {output_csv_path}")
+    print(f"Run config written to: {config_path}")
+    print(f"Run artifacts root: {artifact_root}")
 
 
 if __name__ == "__main__":

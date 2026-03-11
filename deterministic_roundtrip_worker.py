@@ -217,11 +217,12 @@ def _run_orchestrator(config_path: Path):
     config = json.loads(config_path.read_text(encoding="utf-8"))
     files = [Path(p) for p in config["files"]]
     output_csv = Path(config.get("output_csv", "deterministic_roundtrip_results.csv"))
+    artifact_root = Path(config.get("artifact_root", str(ARTIFACT_ROOT)))
     keep_artifacts = bool(config["settings"].get("keep_artifacts", False))
     stop_on_file_error = bool(config["settings"].get("stop_on_file_error", True))
     phase_timeout_seconds = int(config["settings"].get("phase_timeout_seconds", 0) or 0)
 
-    ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
+    artifact_root.mkdir(parents=True, exist_ok=True)
 
     rows = []
     for file_path in files:
@@ -235,7 +236,7 @@ def _run_orchestrator(config_path: Path):
             )
             continue
 
-        job_dir = ARTIFACT_ROOT / _job_id(file_path)
+        job_dir = artifact_root / _job_id(file_path)
         if job_dir.exists():
             for child in job_dir.glob("*"):
                 if child.is_file():

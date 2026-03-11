@@ -13,6 +13,6 @@ build/
 *.egg-info/
 _safe*.txt
 .roundtrip_artifacts/
-deterministic_roundtrip_config.json
-deterministic_roundtrip_results.csv
+deterministic_roundtrip_config*.json
+deterministic_roundtrip_results*.csv
 project_files/
