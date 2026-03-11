@@ -88,7 +88,10 @@ def _load_codec(settings: Dict[str, Any]) -> DeterministicLLMCodec:
     config = DeterministicCodecConfig(
         precision=int(settings.get("precision", 32)),
         slots=int(settings.get("slots", 1 << 24)),
-        use_kv_cache=bool(settings.get("use_kv_cache", False)),
+        context_window=int(settings.get("context_window", 2048)),
+        margin=int(settings.get("margin", 128)),
+        strategy=str(settings.get("strategy", "rolling")),
+        use_legacy_counts=bool(settings.get("use_legacy_counts", False)),
         quant=bool(settings.get("quant", False)),
         logit_round_decimals=int(settings.get("logit_round_decimals", 2)),
         prob_round_decimals=int(settings.get("prob_round_decimals", 5)),

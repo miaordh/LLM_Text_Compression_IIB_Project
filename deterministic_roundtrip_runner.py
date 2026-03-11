@@ -20,7 +20,10 @@ DEVICE = "cpu"  # auto | cpu | cuda | mps
 SAFE_MODE = True
 PRECISION = 32
 SLOTS = 1 << 24
-USE_KV_CACHE = False
+CONTEXT_WINDOW = 2048
+MARGIN = 128
+STRATEGY = "rolling"  # rolling | block | no_kv_cache
+USE_LEGACY_COUNTS = False
 QUANT = False
 LOGIT_ROUND_DECIMALS = 2
 PROB_ROUND_DECIMALS = 5
@@ -35,7 +38,7 @@ FILE_ENCODING_OVERRIDES = {
 }
 
 KEEP_ARTIFACTS = False
-PHASE_TIMEOUT_SECONDS = 10800 # 0 disables timeout
+PHASE_TIMEOUT_SECONDS = 7200 # 0 disables timeout
 STOP_ON_FILE_ERROR = True
 
 # Parallel-run safety:
@@ -47,13 +50,13 @@ RUN_TAG = None
 # - None: run nothing from CANTRBRY_DIR
 # - "all": run every file under CANTRBRY_DIR
 # - list[str]: explicit relative filenames under CANTRBRY_DIR
-CANTRBRY_FILE_SELECTION = ["fields.c"]
+CANTRBRY_FILE_SELECTION = ["Shall I Compare Thee To a Summer's Day.txt"]
 
 # File selection for project root text files:
 # - None: run nothing from project root
 # - "all": run every .txt file directly under project root
 # - list[str]: explicit relative filenames under project root
-CURRENT_FOLDER_TEXT_SELECTION = ["Shall I Compare Thee To a Summer's Day.txt"]
+CURRENT_FOLDER_TEXT_SELECTION = ["再别康桥.txt"]
 
 CANTRBRY_DIR = Path("cantrbry")
 OUTPUT_CSV = Path("deterministic_roundtrip_results.csv")
@@ -128,7 +131,10 @@ def main():
         "safe_mode": SAFE_MODE,
         "precision": PRECISION,
         "slots": SLOTS,
-        "use_kv_cache": USE_KV_CACHE,
+        "context_window": CONTEXT_WINDOW,
+        "margin": MARGIN,
+        "strategy": STRATEGY,
+        "use_legacy_counts": USE_LEGACY_COUNTS,
         "quant": QUANT,
         "logit_round_decimals": LOGIT_ROUND_DECIMALS,
         "prob_round_decimals": PROB_ROUND_DECIMALS,
