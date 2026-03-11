@@ -177,14 +177,25 @@ class DeterministicLLMCodec:
     def _counts_from_probs(self, probs: np.ndarray):
         return probs_to_counts(probs, self.config.slots, self.dec_prec)
 
-    def encode(self, text: str):
-        token_ids = self.tokenizer.encode(text) + [self.eof_token_id]
+    def encode(
+        self,
+        text: str,
+        safe_mode: bool = False,
+        return_token_count: bool = False,
+        show_progress: bool = True,
+    ):
+        token_ids = self.tokenizer.encode(text)
+        if not safe_mode:
+            token_ids = token_ids + [self.eof_token_id]
 
         writer = BitWriter()
         enc = Encoder(Coder(b=self.config.precision), writer)
+        iterator = enumerate(token_ids)
+        if show_progress:
+            iterator = tqdm(iterator, total=len(token_ids), desc="Deterministic Encode")
 
         with self._invariant_context():
-            for idx, token_id in tqdm(enumerate(token_ids), total=len(token_ids), desc="Deterministic Encode"):
+            for idx, token_id in iterator:
                 prefix = token_ids[:idx]
                 logits = self._logits_for_prefix(prefix)
                 probs = self._probs(logits)
@@ -193,13 +204,44 @@ class DeterministicLLMCodec:
 
         enc.finish()
         writer.flush()
-        return writer.getvalue()
+        encoded_bytes = writer.getvalue()
 
-    def decode(self, encoded_bytes: bytes, max_decode_tokens: Optional[int] = None) -> str:
+        if safe_mode or return_token_count:
+            return encoded_bytes, len(token_ids)
+        return encoded_bytes
+
+    def decode(
+        self,
+        encoded_bytes: bytes,
+        max_decode_tokens: Optional[int] = None,
+        safe_mode: bool = False,
+        expected_num_tokens: Optional[int] = None,
+    ) -> str:
         dec = Decoder(Coder(b=self.config.precision), BitReader(encoded_bytes))
         decoded_ids = []
 
+        if safe_mode and expected_num_tokens is None:
+            raise ValueError("safe_mode=True requires expected_num_tokens to be provided.")
+
         with self._invariant_context():
+            if safe_mode:
+                target_tokens = int(expected_num_tokens)
+                while len(decoded_ids) < target_tokens:
+                    idx = len(decoded_ids)
+                    if max_decode_tokens is not None and idx >= max_decode_tokens:
+                        raise RuntimeError(
+                            f"Decoding exceeded max_decode_tokens={max_decode_tokens} before target token count."
+                        )
+
+                    logits = self._logits_for_prefix(decoded_ids)
+                    probs = self._probs(logits)
+                    counts = self._counts_from_probs(probs)
+
+                    token_id = dec.decode_symbol(counts_to_cum_desc(counts))
+                    decoded_ids.append(token_id)
+
+                return self.tokenizer.decode(decoded_ids, skip_special_tokens=True)
+
             token_id = None
             while token_id != self.eof_token_id:
                 idx = len(decoded_ids)
