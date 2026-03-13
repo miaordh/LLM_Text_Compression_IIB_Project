@@ -1,4 +1,5 @@
 import argparse
+import os
 import gc
 import hashlib
 import json
@@ -52,8 +53,11 @@ def _resolve_device(device: str) -> str:
     return "cpu"
 
 
-def _resolve_torch_dtype(dtype_name: str):
+def _resolve_torch_dtype(dtype_name: str, device: str):
     if dtype_name == "auto":
+        # On consumer GPUs, fp16 is typically required for 1B+ models.
+        if device == "cuda":
+            return torch.float16
         return "auto"
     mapping = {
         "float32": torch.float32,
@@ -65,12 +69,35 @@ def _resolve_torch_dtype(dtype_name: str):
     return mapping[dtype_name]
 
 
+def _is_cuda_oom(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "out of memory" in text and ("cuda" in text or "cudnn" in text)
+
+
+def _build_oom_fallback_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
+    fallback = dict(settings)
+    fallback["torch_dtype"] = "float16"
+    fallback["strategy"] = str(settings.get("oom_fallback_strategy", "block"))
+    fallback_window = int(settings.get("oom_fallback_context_window", 512))
+    fallback_margin = int(settings.get("oom_fallback_margin", 64))
+    fallback["context_window"] = max(64, fallback_window)
+    fallback["margin"] = max(0, min(fallback_margin, fallback["context_window"] - 1))
+    return fallback
+
+
 def _load_codec(settings: Dict[str, Any]) -> DeterministicLLMCodec:
+    device = _resolve_device(settings.get("device", "auto"))
+
+    if device == "cuda":
+        # Helps with long-running fragmentation-heavy workloads.
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
     model_kwargs: Dict[str, Any] = {
         "trust_remote_code": bool(settings.get("trust_remote_code", False)),
+        "low_cpu_mem_usage": True,
     }
 
-    torch_dtype = _resolve_torch_dtype(settings.get("torch_dtype", "auto"))
+    torch_dtype = _resolve_torch_dtype(settings.get("torch_dtype", "auto"), device)
     if torch_dtype != "auto":
         model_kwargs["torch_dtype"] = torch_dtype
 
@@ -83,6 +110,10 @@ def _load_codec(settings: Dict[str, Any]) -> DeterministicLLMCodec:
         trust_remote_code=bool(settings.get("trust_remote_code", False)),
         revision=revision,
     )
+    if bool(settings.get("ignore_model_max_length_warning", True)):
+        # We intentionally encode full files and enforce context limits ourselves.
+        tokenizer.model_max_length = int(1e30)
+
     model = AutoModelForCausalLM.from_pretrained(settings["model_id"], **model_kwargs)
 
     config = DeterministicCodecConfig(
@@ -98,7 +129,6 @@ def _load_codec(settings: Dict[str, Any]) -> DeterministicLLMCodec:
         use_batch_invariant_ops=bool(settings.get("use_batch_invariant_ops", True)),
     )
 
-    device = _resolve_device(settings.get("device", "auto"))
     return DeterministicLLMCodec(tokenizer=tokenizer, model=model, device=device, config=config)
 
 
@@ -109,48 +139,80 @@ def _phase_encode(config: Dict[str, Any], file_path: Path, artifact_dir: Path):
 
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
-    codec = None
-    try:
-        codec = _load_codec(settings)
-        text = _read_text(file_path, text_encoding)
+    text = _read_text(file_path, text_encoding)
+    base_attempt = dict(settings)
+    attempts = [base_attempt]
 
-        start = time.time()
-        encoded_result = codec.encode(
-            text,
-            safe_mode=safe_mode,
-            return_token_count=safe_mode,
-            show_progress=False,
-        )
-        encode_seconds = time.time() - start
+    if bool(settings.get("enable_oom_fallback", True)):
+        fallback_attempt = _build_oom_fallback_settings(settings)
+        if fallback_attempt != base_attempt:
+            attempts.append(fallback_attempt)
 
-        if safe_mode:
-            encoded_bytes, num_tokens = encoded_result
-        else:
-            encoded_bytes = encoded_result
-            num_tokens = None
+    last_exc = None
+    for idx, attempt_settings in enumerate(attempts):
+        codec = None
+        try:
+            codec = _load_codec(attempt_settings)
 
-        original_size_bytes = len(text.encode(text_encoding, errors="replace"))
-        (artifact_dir / "encoded.bin").write_bytes(encoded_bytes)
-        metadata = {
-            "input_file": str(file_path),
-            "safe_mode": safe_mode,
-            "num_tokens": num_tokens,
-            "encode_seconds": encode_seconds,
-            "encoded_size_bytes": len(encoded_bytes),
-            "original_size_bytes": original_size_bytes,
-            "text_encoding": text_encoding,
-        }
-        (artifact_dir / "encode_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    finally:
-        if codec is not None:
-            del codec
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            start = time.time()
+            encoded_result = codec.encode(
+                text,
+                safe_mode=safe_mode,
+                return_token_count=safe_mode,
+                show_progress=False,
+            )
+            encode_seconds = time.time() - start
+
+            if safe_mode:
+                encoded_bytes, num_tokens = encoded_result
+            else:
+                encoded_bytes = encoded_result
+                num_tokens = None
+
+            original_size_bytes = len(text.encode(text_encoding, errors="replace"))
+            (artifact_dir / "encoded.bin").write_bytes(encoded_bytes)
+            metadata = {
+                "input_file": str(file_path),
+                "safe_mode": safe_mode,
+                "num_tokens": num_tokens,
+                "encode_seconds": encode_seconds,
+                "encoded_size_bytes": len(encoded_bytes),
+                "original_size_bytes": original_size_bytes,
+                "text_encoding": text_encoding,
+                "effective_settings": {
+                    "device": attempt_settings.get("device", "auto"),
+                    "torch_dtype": attempt_settings.get("torch_dtype", "auto"),
+                    "context_window": int(attempt_settings.get("context_window", 2048)),
+                    "margin": int(attempt_settings.get("margin", 128)),
+                    "strategy": str(attempt_settings.get("strategy", "rolling")),
+                    "quant": bool(attempt_settings.get("quant", False)),
+                    "logit_round_decimals": int(attempt_settings.get("logit_round_decimals", 2)),
+                    "prob_round_decimals": int(attempt_settings.get("prob_round_decimals", 5)),
+                    "use_legacy_counts": bool(attempt_settings.get("use_legacy_counts", False)),
+                    "use_batch_invariant_ops": bool(attempt_settings.get("use_batch_invariant_ops", True)),
+                },
+                "used_oom_fallback": idx > 0,
+            }
+            (artifact_dir / "encode_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+            return
+        except RuntimeError as exc:
+            last_exc = exc
+            has_next_attempt = (idx + 1) < len(attempts)
+            if not (_is_cuda_oom(exc) and has_next_attempt):
+                raise
+        finally:
+            if codec is not None:
+                del codec
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    if last_exc is not None:
+        raise last_exc
 
 
 def _phase_decode(config: Dict[str, Any], artifact_dir: Path):
-    settings = config["settings"]
+    settings = dict(config["settings"])
     safe_mode = bool(settings.get("safe_mode", True))
 
     encode_meta_path = artifact_dir / "encode_metadata.json"
@@ -160,6 +222,9 @@ def _phase_decode(config: Dict[str, Any], artifact_dir: Path):
         raise FileNotFoundError(f"Missing encode artifacts in {artifact_dir}")
 
     encode_meta = json.loads(encode_meta_path.read_text(encoding="utf-8"))
+    effective_settings = encode_meta.get("effective_settings")
+    if isinstance(effective_settings, dict):
+        settings.update(effective_settings)
 
     text_encoding = encode_meta.get("text_encoding", settings.get("text_encoding", "utf-8"))
     codec = None
@@ -216,6 +281,22 @@ def _run_subprocess(args: List[str], timeout_seconds: int = 0):
         return 124, msg
 
 
+def _cleanup_job_dir(job_dir: Path):
+    if not job_dir.exists():
+        return
+    for child in job_dir.glob("*"):
+        if child.is_file():
+            child.unlink()
+    job_dir.rmdir()
+
+
+def _cleanup_memory():
+    # Defensive cleanup in the orchestrator process between files.
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def _run_orchestrator(config_path: Path):
     config = json.loads(config_path.read_text(encoding="utf-8"))
     files = [Path(p) for p in config["files"]]
@@ -229,118 +310,115 @@ def _run_orchestrator(config_path: Path):
 
     rows = []
     for file_path in files:
-        if not file_path.exists() or not file_path.is_file():
-            rows.append(
-                {
-                    "file": str(file_path),
-                    "status": "skipped",
-                    "error": "File does not exist or is not a file",
-                }
-            )
-            continue
-
         job_dir = artifact_root / _job_id(file_path)
-        if job_dir.exists():
-            for child in job_dir.glob("*"):
-                if child.is_file():
-                    child.unlink()
-        job_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            if not file_path.exists() or not file_path.is_file():
+                rows.append(
+                    {
+                        "file": str(file_path),
+                        "status": "skipped",
+                        "error": "File does not exist or is not a file",
+                    }
+                )
+                continue
 
-        encode_cmd = [
-            sys.executable,
-            __file__,
-            "--phase",
-            "encode",
-            "--config",
-            str(config_path),
-            "--file",
-            str(file_path),
-            "--artifact-dir",
-            str(job_dir),
-        ]
-        rc_enc, err_enc = _run_subprocess(encode_cmd, timeout_seconds=phase_timeout_seconds)
-        if rc_enc != 0:
-            rows.append(
-                {
-                    "file": str(file_path),
-                    "status": "encode_failed",
-                    "error": (err_enc or "Encode phase failed").strip(),
-                }
+            if job_dir.exists():
+                _cleanup_job_dir(job_dir)
+            job_dir.mkdir(parents=True, exist_ok=True)
+
+            encode_cmd = [
+                sys.executable,
+                __file__,
+                "--phase",
+                "encode",
+                "--config",
+                str(config_path),
+                "--file",
+                str(file_path),
+                "--artifact-dir",
+                str(job_dir),
+            ]
+            rc_enc, err_enc = _run_subprocess(encode_cmd, timeout_seconds=phase_timeout_seconds)
+            if rc_enc != 0:
+                rows.append(
+                    {
+                        "file": str(file_path),
+                        "status": "encode_failed",
+                        "error": (err_enc or "Encode phase failed").strip(),
+                    }
+                )
+                if not keep_artifacts:
+                    _cleanup_job_dir(job_dir)
+                continue
+
+            decode_cmd = [
+                sys.executable,
+                __file__,
+                "--phase",
+                "decode",
+                "--config",
+                str(config_path),
+                "--artifact-dir",
+                str(job_dir),
+            ]
+            rc_dec, err_dec = _run_subprocess(decode_cmd, timeout_seconds=phase_timeout_seconds)
+            if rc_dec != 0:
+                rows.append(
+                    {
+                        "file": str(file_path),
+                        "status": "decode_failed",
+                        "error": (err_dec or "Decode phase failed").strip(),
+                    }
+                )
+                if not keep_artifacts:
+                    _cleanup_job_dir(job_dir)
+                continue
+
+            encode_meta = json.loads((job_dir / "encode_metadata.json").read_text(encoding="utf-8"))
+            file_encoding = encode_meta.get("text_encoding", config["settings"].get("text_encoding", "utf-8"))
+
+            original_text = _read_text(file_path, file_encoding)
+            decoded_text = (job_dir / "decoded.txt").read_text(
+                encoding=file_encoding,
+                errors="replace",
             )
+
+            decode_meta = json.loads((job_dir / "decode_metadata.json").read_text(encoding="utf-8"))
+
+            is_match = original_text == decoded_text
+            row = {
+                "file": str(file_path),
+                "status": "ok" if is_match else "mismatch",
+                "input_size_bytes": encode_meta.get("original_size_bytes", 0),
+                "safe_mode": encode_meta["safe_mode"],
+                "num_tokens": encode_meta["num_tokens"],
+                "encoded_size_bytes": encode_meta["encoded_size_bytes"],
+                "compression_ratio": (
+                    (encode_meta["encoded_size_bytes"] * 8) / encode_meta.get("original_size_bytes", 1)
+                    if encode_meta.get("original_size_bytes", 0) > 0
+                    else None
+                ),
+                "encode_seconds": encode_meta["encode_seconds"],
+                "decode_seconds": decode_meta["decode_seconds"],
+                "original_chars": len(original_text),
+                "decoded_chars": decode_meta["decoded_chars"],
+                "error": "",
+            }
+            rows.append(row)
+
             if not keep_artifacts:
-                for child in job_dir.glob("*"):
-                    if child.is_file():
-                        child.unlink()
-                job_dir.rmdir()
-            if stop_on_file_error:
-                break
-            continue
+                _cleanup_job_dir(job_dir)
+        finally:
+            # Always clear parent-process memory/cache before moving to next file,
+            # including timeout/error paths and any early continue.
+            _cleanup_memory()
 
-        decode_cmd = [
-            sys.executable,
-            __file__,
-            "--phase",
-            "decode",
-            "--config",
-            str(config_path),
-            "--artifact-dir",
-            str(job_dir),
-        ]
-        rc_dec, err_dec = _run_subprocess(decode_cmd, timeout_seconds=phase_timeout_seconds)
-        if rc_dec != 0:
-            rows.append(
-                {
-                    "file": str(file_path),
-                    "status": "decode_failed",
-                    "error": (err_dec or "Decode phase failed").strip(),
-                }
-            )
-            if not keep_artifacts:
-                for child in job_dir.glob("*"):
-                    if child.is_file():
-                        child.unlink()
-                job_dir.rmdir()
-            if stop_on_file_error:
-                break
-            continue
-
-        encode_meta = json.loads((job_dir / "encode_metadata.json").read_text(encoding="utf-8"))
-        file_encoding = encode_meta.get("text_encoding", config["settings"].get("text_encoding", "utf-8"))
-
-        original_text = _read_text(file_path, file_encoding)
-        decoded_text = (job_dir / "decoded.txt").read_text(
-            encoding=file_encoding,
-            errors="replace",
+    if stop_on_file_error:
+        print(
+            "Note: stop_on_file_error is enabled but per-file errors now only stop that file; "
+            "the runner continues with remaining files.",
+            file=sys.stderr,
         )
-
-        decode_meta = json.loads((job_dir / "decode_metadata.json").read_text(encoding="utf-8"))
-
-        is_match = original_text == decoded_text
-        row = {
-            "file": str(file_path),
-            "status": "ok" if is_match else "mismatch",
-            "input_size_bytes": encode_meta.get("original_size_bytes", 0),
-            "safe_mode": encode_meta["safe_mode"],
-            "num_tokens": encode_meta["num_tokens"],
-            "encoded_size_bytes": encode_meta["encoded_size_bytes"],
-            "compression_ratio": (
-                (encode_meta["encoded_size_bytes"] * 8) / encode_meta.get("original_size_bytes", 1)
-                if encode_meta.get("original_size_bytes", 0) > 0
-                else None
-            ),
-            "encode_seconds": encode_meta["encode_seconds"],
-            "decode_seconds": decode_meta["decode_seconds"],
-            "original_chars": len(original_text),
-            "decoded_chars": decode_meta["decoded_chars"],
-            "error": "",
-        }
-        rows.append(row)
-
-        if not keep_artifacts:
-            for child in job_dir.glob("*"):
-                if child.is_file():
-                    child.unlink()
-            job_dir.rmdir()
 
     pd.DataFrame(rows).to_csv(output_csv, index=False)
 

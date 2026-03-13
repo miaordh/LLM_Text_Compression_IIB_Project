@@ -16,3 +16,4 @@ _safe*.txt
 deterministic_roundtrip_config*.json
 deterministic_roundtrip_results*.csv
 project_files/
+logs/

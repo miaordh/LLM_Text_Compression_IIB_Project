@@ -11,23 +11,33 @@ from typing import List
 # ---------------------------
 # Runner settings (edit me)
 # ---------------------------
-MODEL_ID = "deepseek-ai/deepseek-coder-1.3b-base"
+MODEL_ID = "Qwen/Qwen2.5-0.5B"
 REVISION = None
 TRUST_REMOTE_CODE = False
 TORCH_DTYPE = "auto"  # auto | float32 | float16 | bfloat16
-DEVICE = "cpu"  # auto | cpu | cuda | mps
+DEVICE = "cuda"  # auto | cpu | cuda | mps
+
+# Large-file safety knobs (used by worker):
+# - ignore_model_max_length_warning suppresses benign tokenizer warnings when
+#   full-file tokenization is intentional.
+# - enable_oom_fallback retries encode with smaller KV settings on CUDA OOM.
+IGNORE_MODEL_MAX_LENGTH_WARNING = True
+ENABLE_OOM_FALLBACK = True
+OOM_FALLBACK_STRATEGY = "block"  # rolling | block | no_kv_cache
+OOM_FALLBACK_CONTEXT_WINDOW = 512
+OOM_FALLBACK_MARGIN = 64
 
 SAFE_MODE = True
 PRECISION = 32
 SLOTS = 1 << 24
-CONTEXT_WINDOW = 2048
+CONTEXT_WINDOW = 1024
 MARGIN = 128
 STRATEGY = "rolling"  # rolling | block | no_kv_cache
 USE_LEGACY_COUNTS = False
 QUANT = False
 LOGIT_ROUND_DECIMALS = 2
 PROB_ROUND_DECIMALS = 5
-USE_BATCH_INVARIANT_OPS = True
+USE_BATCH_INVARIANT_OPS = False
 MAX_DECODE_TOKENS = None
 
 TEXT_ENCODING = "utf-8"
@@ -38,7 +48,9 @@ FILE_ENCODING_OVERRIDES = {
 }
 
 KEEP_ARTIFACTS = False
-PHASE_TIMEOUT_SECONDS = 7200 # 0 disables timeout
+PHASE_TIMEOUT_SECONDS = 18000 # 0 disables timeout
+# Per-file behavior: when True, a file stops immediately on encode/decode error,
+# but the run still continues with remaining files.
 STOP_ON_FILE_ERROR = True
 
 # Parallel-run safety:
@@ -50,13 +62,13 @@ RUN_TAG = None
 # - None: run nothing from CANTRBRY_DIR
 # - "all": run every file under CANTRBRY_DIR
 # - list[str]: explicit relative filenames under CANTRBRY_DIR
-CANTRBRY_FILE_SELECTION = ["Shall I Compare Thee To a Summer's Day.txt"]
+CANTRBRY_FILE_SELECTION = ["kennedy.xls", "plrabn12.txt", "ptt5"]
 
 # File selection for project root text files:
 # - None: run nothing from project root
 # - "all": run every .txt file directly under project root
 # - list[str]: explicit relative filenames under project root
-CURRENT_FOLDER_TEXT_SELECTION = ["再别康桥.txt"]
+CURRENT_FOLDER_TEXT_SELECTION = None
 
 CANTRBRY_DIR = Path("cantrbry")
 OUTPUT_CSV = Path("deterministic_roundtrip_results.csv")
@@ -128,6 +140,11 @@ def main():
         "trust_remote_code": TRUST_REMOTE_CODE,
         "torch_dtype": TORCH_DTYPE,
         "device": DEVICE,
+        "ignore_model_max_length_warning": IGNORE_MODEL_MAX_LENGTH_WARNING,
+        "enable_oom_fallback": ENABLE_OOM_FALLBACK,
+        "oom_fallback_strategy": OOM_FALLBACK_STRATEGY,
+        "oom_fallback_context_window": OOM_FALLBACK_CONTEXT_WINDOW,
+        "oom_fallback_margin": OOM_FALLBACK_MARGIN,
         "safe_mode": SAFE_MODE,
         "precision": PRECISION,
         "slots": SLOTS,
