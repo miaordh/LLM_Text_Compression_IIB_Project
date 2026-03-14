@@ -23,6 +23,7 @@ SAFE_MODE = True
 MAX_DECODE_TOKENS = None
 SHOW_PROGRESS = False
 TEXT_ENCODING = "utf-8"
+PASS_REQUIRES_ZERO_CORRECTION = True
 
 # Dataset selection
 CURRENT_FOLDER_TEXT_SELECTION = ["Shall I Compare Thee To a Summer's Day.txt"]
@@ -144,6 +145,7 @@ def main():
             "max_decode_tokens": MAX_DECODE_TOKENS,
             "show_progress": SHOW_PROGRESS,
             "text_encoding": TEXT_ENCODING,
+            "pass_requires_zero_correction": PASS_REQUIRES_ZERO_CORRECTION,
             "ignore_model_max_length_warning": True,
         },
         "output_csv": str(output_csv_path),

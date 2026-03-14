@@ -122,6 +122,7 @@ def _run_trial_on_file(
     safe_mode = bool(global_settings.get("safe_mode", True))
     max_decode_tokens = global_settings.get("max_decode_tokens")
     show_progress = bool(global_settings.get("show_progress", False))
+    pass_requires_zero_correction = bool(global_settings.get("pass_requires_zero_correction", True))
 
     device_mode = str(global_settings.get("device_mode", "single_device")).strip().lower()
     base_device = _resolve_device(str(global_settings.get("device", "auto")))
@@ -187,11 +188,13 @@ def _run_trial_on_file(
             (encoded_size_bytes * 8.0) / original_size_bytes if original_size_bytes > 0 else float("nan")
         )
 
-        ok = decoded_text == text
+        decoded_match = decoded_text == text
+        zero_recenter = int(drift_summary["corrections_applied"]) == 0
+        passed = decoded_match and (zero_recenter or (not pass_requires_zero_correction))
         return {
             "file": str(file_path),
             "trial_id": trial_id,
-            "status": "ok" if ok else "mismatch",
+            "status": "ok" if passed else "mismatch",
             "device_mode": device_mode,
             "encode_device": encode_device,
             "decode_device": decode_device,
@@ -212,6 +215,9 @@ def _run_trial_on_file(
             "original_chars": len(text),
             "drift_events": drift_summary["drift_events"],
             "corrections_applied": drift_summary["corrections_applied"],
+            "decoded_match": int(decoded_match),
+            "zero_recenter": int(zero_recenter),
+            "pass_requires_zero_correction": int(pass_requires_zero_correction),
             "mean_abs_interval_low_delta": drift_summary["mean_abs_interval_low_delta"],
             "mean_abs_interval_high_delta": drift_summary["mean_abs_interval_high_delta"],
             "mean_distance_D_to_reference_interval": drift_summary["mean_distance_D_to_reference_interval"],
@@ -243,6 +249,9 @@ def _run_trial_on_file(
             "original_chars": None,
             "drift_events": None,
             "corrections_applied": None,
+            "decoded_match": None,
+            "zero_recenter": None,
+            "pass_requires_zero_correction": int(pass_requires_zero_correction),
             "mean_abs_interval_low_delta": None,
             "mean_abs_interval_high_delta": None,
             "mean_distance_D_to_reference_interval": None,
