@@ -113,12 +113,32 @@ class Coder:
 
     def set_interval_and_renorm_encode(self, new_low: int, new_high: int) -> None:
         """Set absolute interval [new_low, new_high] and renormalise for encoder."""
+        width = int(new_high) - int(new_low) + 1
+        if width <= 0:
+            raise RuntimeError(
+                f"set_interval_and_renorm_encode: invalid interval [{new_low}, {new_high}] (width={width})"
+            )
+        if width > (self.tb + 1):
+            raise RuntimeError(
+                f"set_interval_and_renorm_encode: interval width {width} exceeds coder range {self.tb + 1}"
+            )
+
         self.L = new_low & self.mask
-        self.R = ((new_high - new_low + 1) & self.mask)
+        self.R = width
         self._output_bits()
 
     def set_interval_and_renorm_decode(self, new_low: int, new_high: int) -> None:
         """Set absolute interval [new_low, new_high] and renormalise for decoder."""
+        width = int(new_high) - int(new_low) + 1
+        if width <= 0:
+            raise RuntimeError(
+                f"set_interval_and_renorm_decode: invalid interval [{new_low}, {new_high}] (width={width})"
+            )
+        if width > (self.tb + 1):
+            raise RuntimeError(
+                f"set_interval_and_renorm_decode: interval width {width} exceeds coder range {self.tb + 1}"
+            )
+
         self.L = new_low & self.mask
-        self.R = ((new_high - new_low + 1) & self.mask)
+        self.R = width
         self._discard_bits()

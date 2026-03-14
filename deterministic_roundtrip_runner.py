@@ -14,8 +14,9 @@ from typing import List
 MODEL_ID = "Qwen/Qwen2.5-0.5B"
 REVISION = None
 TRUST_REMOTE_CODE = False
-TORCH_DTYPE = "auto"  # auto | float32 | float16 | bfloat16
+TORCH_DTYPE = "float16"  # auto | float32 | float16 | bfloat16
 DEVICE = "cuda"  # auto | cpu | cuda | mps
+DEVICE_MODE = "cross_device"  # single_device | cross_device
 
 # Large-file safety knobs (used by worker):
 # - ignore_model_max_length_warning suppresses benign tokenizer warnings when
@@ -24,8 +25,8 @@ DEVICE = "cuda"  # auto | cpu | cuda | mps
 IGNORE_MODEL_MAX_LENGTH_WARNING = True
 ENABLE_OOM_FALLBACK = True
 OOM_FALLBACK_STRATEGY = "block"  # rolling | block | no_kv_cache
-OOM_FALLBACK_CONTEXT_WINDOW = 512
-OOM_FALLBACK_MARGIN = 64
+OOM_FALLBACK_CONTEXT_WINDOW = 128
+OOM_FALLBACK_MARGIN = 16
 
 SAFE_MODE = True
 PRECISION = 32
@@ -35,10 +36,16 @@ MARGIN = 128
 STRATEGY = "rolling"  # rolling | block | no_kv_cache
 USE_LEGACY_COUNTS = False
 QUANT = False
-LOGIT_ROUND_DECIMALS = 2
-PROB_ROUND_DECIMALS = 5
-USE_BATCH_INVARIANT_OPS = False
+LOGIT_ROUND_DECIMALS = 15
+PROB_ROUND_DECIMALS = 1
+# None | batch_invariant_ops | tbik
+# In cross_device mode, worker encodes on CPU and decodes on accelerator.
+DETERMINISM_MODE = "tbik"
 MAX_DECODE_TOKENS = None
+DIAGNOSTICS_ENABLED = True
+# Optional diagnostics CSV prefix. If None and diagnostics is enabled, worker writes
+# per-file CSVs under that file's artifact directory.
+DIAGNOSTICS_CSV_PREFIX = None
 
 TEXT_ENCODING = "utf-8"
 # Optional per-file text encoding overrides.
@@ -62,13 +69,16 @@ RUN_TAG = None
 # - None: run nothing from CANTRBRY_DIR
 # - "all": run every file under CANTRBRY_DIR
 # - list[str]: explicit relative filenames under CANTRBRY_DIR
-CANTRBRY_FILE_SELECTION = ["kennedy.xls", "plrabn12.txt", "ptt5"]
+# CANTRBRY_FILE_SELECTION = ["alice29.txt", "asyoulik.txt", "cp.html", "kennedy.xls", "lcet10.txt", "plrabn12.txt", "ptt5"]
+CANTRBRY_FILE_SELECTION = None
 
 # File selection for project root text files:
 # - None: run nothing from project root
 # - "all": run every .txt file directly under project root
 # - list[str]: explicit relative filenames under project root
-CURRENT_FOLDER_TEXT_SELECTION = None
+# CURRENT_FOLDER_TEXT_SELECTION = ["Shall I Compare Thee To a Summer's Day.txt", "再别康桥.txt"]
+CURRENT_FOLDER_TEXT_SELECTION = ["Shall I Compare Thee To a Summer's Day.txt"]
+# CURRENT_FOLDER_TEXT_SELECTION = None
 
 CANTRBRY_DIR = Path("cantrbry")
 OUTPUT_CSV = Path("deterministic_roundtrip_results.csv")
@@ -140,6 +150,7 @@ def main():
         "trust_remote_code": TRUST_REMOTE_CODE,
         "torch_dtype": TORCH_DTYPE,
         "device": DEVICE,
+        "device_mode": DEVICE_MODE,
         "ignore_model_max_length_warning": IGNORE_MODEL_MAX_LENGTH_WARNING,
         "enable_oom_fallback": ENABLE_OOM_FALLBACK,
         "oom_fallback_strategy": OOM_FALLBACK_STRATEGY,
@@ -155,8 +166,10 @@ def main():
         "quant": QUANT,
         "logit_round_decimals": LOGIT_ROUND_DECIMALS,
         "prob_round_decimals": PROB_ROUND_DECIMALS,
-        "use_batch_invariant_ops": USE_BATCH_INVARIANT_OPS,
+        "determinism_mode": DETERMINISM_MODE,
         "max_decode_tokens": MAX_DECODE_TOKENS,
+        "diagnostics_enabled": DIAGNOSTICS_ENABLED,
+        "diagnostics_csv_prefix": DIAGNOSTICS_CSV_PREFIX,
         "text_encoding": TEXT_ENCODING,
         "file_encoding_overrides": FILE_ENCODING_OVERRIDES,
         "keep_artifacts": KEEP_ARTIFACTS,

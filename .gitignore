@@ -17,3 +17,7 @@ deterministic_roundtrip_config*.json
 deterministic_roundtrip_results*.csv
 project_files/
 logs/
+llm_reproducibility/
+drift_search_config*.json
+.drift_search_results*.csv
+.drift_search_artifacts/

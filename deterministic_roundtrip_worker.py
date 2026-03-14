@@ -15,8 +15,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from llm_codec_deterministic import DeterministicCodecConfig, DeterministicLLMCodec
 
+# Transformers warns that TRANSFORMERS_CACHE is deprecated; prefer HF_HOME.
+if os.environ.get("TRANSFORMERS_CACHE") and not os.environ.get("HF_HOME"):
+    os.environ["HF_HOME"] = os.environ["TRANSFORMERS_CACHE"]
+    os.environ.pop("TRANSFORMERS_CACHE", None)
+
 
 ARTIFACT_ROOT = Path(".roundtrip_artifacts")
+ENCODE_ATTEMPT_MARKER = "__ROUNDTRIP_ENCODE_ATTEMPT__"
 
 
 def _read_text(path: Path, encoding: str) -> str:
@@ -53,6 +59,33 @@ def _resolve_device(device: str) -> str:
     return "cpu"
 
 
+def _resolve_device_mode(settings: Dict[str, Any]) -> str:
+    mode = str(settings.get("device_mode", "single_device")).strip().lower()
+    if mode not in {"single_device", "cross_device"}:
+        raise ValueError("Unsupported device_mode. Expected 'single_device' or 'cross_device'.")
+    return mode
+
+
+def _preferred_accelerator_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    raise RuntimeError("cross_device mode requires an accelerator for decode, but neither CUDA nor MPS is available")
+
+
+def _resolve_determinism_mode(settings: Dict[str, Any]):
+    mode = settings.get("determinism_mode")
+    if mode is None and "use_batch_invariant_ops" in settings:
+        return "batch_invariant_ops" if bool(settings.get("use_batch_invariant_ops")) else None
+    if mode is None:
+        return None
+    text = str(mode).strip().lower()
+    if text in {"", "none", "off", "false", "0"}:
+        return None
+    return text
+
+
 def _resolve_torch_dtype(dtype_name: str, device: str):
     if dtype_name == "auto":
         # On consumer GPUs, fp16 is typically required for 1B+ models.
@@ -85,6 +118,61 @@ def _build_oom_fallback_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
     return fallback
 
 
+def _emit_encode_attempt_marker(attempt_index: int, total_attempts: int):
+    print(
+        f"{ENCODE_ATTEMPT_MARKER} attempt={attempt_index + 1} total={total_attempts} fallback={int(attempt_index > 0)}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _parse_encode_attempt_info(stderr_text: str):
+    attempt_count = 0
+    fallback_attempted = False
+    for line in (stderr_text or "").splitlines():
+        if ENCODE_ATTEMPT_MARKER not in line:
+            continue
+        # Expected format: __ROUNDTRIP_ENCODE_ATTEMPT__ attempt=1 total=2 fallback=0
+        parts = line.strip().split()
+        kv = {}
+        for part in parts[1:]:
+            if "=" in part:
+                k, v = part.split("=", 1)
+                kv[k] = v
+        try:
+            attempt_count = max(attempt_count, int(kv.get("attempt", "0")))
+        except ValueError:
+            pass
+        fallback_attempted = fallback_attempted or kv.get("fallback") == "1"
+    return attempt_count, fallback_attempted
+
+
+def _sanitize_error_text(stderr_text: str) -> str:
+    if not stderr_text:
+        return ""
+
+    lines = []
+    previous_blank = False
+    for raw_line in stderr_text.splitlines():
+        line = raw_line.replace("\r", "").rstrip()
+        if ENCODE_ATTEMPT_MARKER in line:
+            continue
+        if "Loading weights:" in line:
+            continue
+
+        if not line:
+            if previous_blank:
+                continue
+            previous_blank = True
+            lines.append("")
+            continue
+
+        previous_blank = False
+        lines.append(line)
+
+    return "\n".join(lines).strip()
+
+
 def _load_codec(settings: Dict[str, Any]) -> DeterministicLLMCodec:
     device = _resolve_device(settings.get("device", "auto"))
 
@@ -99,7 +187,8 @@ def _load_codec(settings: Dict[str, Any]) -> DeterministicLLMCodec:
 
     torch_dtype = _resolve_torch_dtype(settings.get("torch_dtype", "auto"), device)
     if torch_dtype != "auto":
-        model_kwargs["torch_dtype"] = torch_dtype
+        # Newer Transformers prefers `dtype`; older versions still accept `torch_dtype`.
+        model_kwargs["dtype"] = torch_dtype
 
     revision = settings.get("revision")
     if revision:
@@ -114,7 +203,24 @@ def _load_codec(settings: Dict[str, Any]) -> DeterministicLLMCodec:
         # We intentionally encode full files and enforce context limits ourselves.
         tokenizer.model_max_length = int(1e30)
 
-    model = AutoModelForCausalLM.from_pretrained(settings["model_id"], **model_kwargs)
+    slots = int(settings.get("slots", 1 << 24))
+    vocab_size = len(tokenizer)
+    if slots < vocab_size:
+        raise ValueError(
+            f"Invalid slots={slots} for vocab_size={vocab_size}. "
+            "Use slots >= vocab size (for example 1<<18 or 1<<20 for ~150k vocab)."
+        )
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(settings["model_id"], **model_kwargs)
+    except TypeError:
+        if "dtype" not in model_kwargs:
+            raise
+        fallback_kwargs = dict(model_kwargs)
+        fallback_kwargs["torch_dtype"] = fallback_kwargs.pop("dtype")
+        model = AutoModelForCausalLM.from_pretrained(settings["model_id"], **fallback_kwargs)
+
+    determinism_mode = _resolve_determinism_mode(settings)
 
     config = DeterministicCodecConfig(
         precision=int(settings.get("precision", 32)),
@@ -126,7 +232,8 @@ def _load_codec(settings: Dict[str, Any]) -> DeterministicLLMCodec:
         quant=bool(settings.get("quant", False)),
         logit_round_decimals=int(settings.get("logit_round_decimals", 2)),
         prob_round_decimals=int(settings.get("prob_round_decimals", 5)),
-        use_batch_invariant_ops=bool(settings.get("use_batch_invariant_ops", True)),
+        diagnostics_csv_prefix=settings.get("diagnostics_csv_prefix"),
+        determinism_mode=determinism_mode,
     )
 
     return DeterministicLLMCodec(tokenizer=tokenizer, model=model, device=device, config=config)
@@ -136,11 +243,15 @@ def _phase_encode(config: Dict[str, Any], file_path: Path, artifact_dir: Path):
     settings = config["settings"]
     safe_mode = bool(settings.get("safe_mode", True))
     text_encoding = _encoding_for_file(settings, file_path)
+    device_mode = _resolve_device_mode(settings)
+    diagnostics_enabled = bool(settings.get("diagnostics_enabled", False))
 
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
     text = _read_text(file_path, text_encoding)
     base_attempt = dict(settings)
+    if device_mode == "cross_device":
+        base_attempt["device"] = "cpu"
     attempts = [base_attempt]
 
     if bool(settings.get("enable_oom_fallback", True)):
@@ -152,6 +263,9 @@ def _phase_encode(config: Dict[str, Any], file_path: Path, artifact_dir: Path):
     for idx, attempt_settings in enumerate(attempts):
         codec = None
         try:
+            _emit_encode_attempt_marker(idx, len(attempts))
+            if diagnostics_enabled and not attempt_settings.get("diagnostics_csv_prefix"):
+                attempt_settings["diagnostics_csv_prefix"] = str(artifact_dir / f"diagnostics_attempt_{idx + 1}")
             codec = _load_codec(attempt_settings)
 
             start = time.time()
@@ -179,6 +293,7 @@ def _phase_encode(config: Dict[str, Any], file_path: Path, artifact_dir: Path):
                 "encoded_size_bytes": len(encoded_bytes),
                 "original_size_bytes": original_size_bytes,
                 "text_encoding": text_encoding,
+                "device_mode": device_mode,
                 "effective_settings": {
                     "device": attempt_settings.get("device", "auto"),
                     "torch_dtype": attempt_settings.get("torch_dtype", "auto"),
@@ -188,8 +303,9 @@ def _phase_encode(config: Dict[str, Any], file_path: Path, artifact_dir: Path):
                     "quant": bool(attempt_settings.get("quant", False)),
                     "logit_round_decimals": int(attempt_settings.get("logit_round_decimals", 2)),
                     "prob_round_decimals": int(attempt_settings.get("prob_round_decimals", 5)),
+                    "diagnostics_csv_prefix": attempt_settings.get("diagnostics_csv_prefix"),
                     "use_legacy_counts": bool(attempt_settings.get("use_legacy_counts", False)),
-                    "use_batch_invariant_ops": bool(attempt_settings.get("use_batch_invariant_ops", True)),
+                    "determinism_mode": _resolve_determinism_mode(attempt_settings),
                 },
                 "used_oom_fallback": idx > 0,
             }
@@ -214,6 +330,9 @@ def _phase_encode(config: Dict[str, Any], file_path: Path, artifact_dir: Path):
 def _phase_decode(config: Dict[str, Any], artifact_dir: Path):
     settings = dict(config["settings"])
     safe_mode = bool(settings.get("safe_mode", True))
+    device_mode = _resolve_device_mode(settings)
+    decode_device_override = settings.get("decode_device_override")
+    diagnostics_enabled = bool(settings.get("diagnostics_enabled", False))
 
     encode_meta_path = artifact_dir / "encode_metadata.json"
     encoded_path = artifact_dir / "encoded.bin"
@@ -225,6 +344,15 @@ def _phase_decode(config: Dict[str, Any], artifact_dir: Path):
     effective_settings = encode_meta.get("effective_settings")
     if isinstance(effective_settings, dict):
         settings.update(effective_settings)
+
+    if device_mode == "cross_device":
+        settings["device"] = _preferred_accelerator_device()
+
+    if decode_device_override is not None:
+        settings["device"] = str(decode_device_override)
+
+    if diagnostics_enabled and not settings.get("diagnostics_csv_prefix"):
+        settings["diagnostics_csv_prefix"] = str(artifact_dir / "diagnostics")
 
     text_encoding = encode_meta.get("text_encoding", settings.get("text_encoding", "utf-8"))
     codec = None
@@ -303,8 +431,16 @@ def _run_orchestrator(config_path: Path):
     output_csv = Path(config.get("output_csv", "deterministic_roundtrip_results.csv"))
     artifact_root = Path(config.get("artifact_root", str(ARTIFACT_ROOT)))
     keep_artifacts = bool(config["settings"].get("keep_artifacts", False))
+    diagnostics_enabled = bool(config["settings"].get("diagnostics_enabled", False))
+    diagnostics_csv_prefix = config["settings"].get("diagnostics_csv_prefix")
     stop_on_file_error = bool(config["settings"].get("stop_on_file_error", True))
     phase_timeout_seconds = int(config["settings"].get("phase_timeout_seconds", 0) or 0)
+
+    # When diagnostics are enabled and no explicit prefix is set, per-token CSVs are
+    # written under each job artifact directory. Keep those artifacts so diagnostics survive.
+    preserve_job_artifacts = keep_artifacts or (
+        diagnostics_enabled and not diagnostics_csv_prefix
+    )
 
     artifact_root.mkdir(parents=True, exist_ok=True)
 
@@ -318,6 +454,8 @@ def _run_orchestrator(config_path: Path):
                         "file": str(file_path),
                         "status": "skipped",
                         "error": "File does not exist or is not a file",
+                        "fallback_attempted": False,
+                        "attempt_count": 0,
                     }
                 )
                 continue
@@ -340,14 +478,17 @@ def _run_orchestrator(config_path: Path):
             ]
             rc_enc, err_enc = _run_subprocess(encode_cmd, timeout_seconds=phase_timeout_seconds)
             if rc_enc != 0:
+                attempt_count, fallback_attempted = _parse_encode_attempt_info(err_enc or "")
                 rows.append(
                     {
                         "file": str(file_path),
                         "status": "encode_failed",
-                        "error": (err_enc or "Encode phase failed").strip(),
+                        "error": _sanitize_error_text(err_enc or "Encode phase failed"),
+                        "fallback_attempted": fallback_attempted,
+                        "attempt_count": attempt_count,
                     }
                 )
-                if not keep_artifacts:
+                if not preserve_job_artifacts:
                     _cleanup_job_dir(job_dir)
                 continue
 
@@ -363,14 +504,26 @@ def _run_orchestrator(config_path: Path):
             ]
             rc_dec, err_dec = _run_subprocess(decode_cmd, timeout_seconds=phase_timeout_seconds)
             if rc_dec != 0:
+                fallback_attempted = False
+                attempt_count = 0
+                encode_meta_for_decode = job_dir / "encode_metadata.json"
+                if encode_meta_for_decode.exists():
+                    try:
+                        meta = json.loads(encode_meta_for_decode.read_text(encoding="utf-8"))
+                        fallback_attempted = bool(meta.get("used_oom_fallback", False))
+                        attempt_count = 2 if fallback_attempted else 1
+                    except Exception:
+                        pass
                 rows.append(
                     {
                         "file": str(file_path),
                         "status": "decode_failed",
-                        "error": (err_dec or "Decode phase failed").strip(),
+                        "error": _sanitize_error_text(err_dec or "Decode phase failed"),
+                        "fallback_attempted": fallback_attempted,
+                        "attempt_count": attempt_count,
                     }
                 )
-                if not keep_artifacts:
+                if not preserve_job_artifacts:
                     _cleanup_job_dir(job_dir)
                 continue
 
@@ -402,11 +555,13 @@ def _run_orchestrator(config_path: Path):
                 "decode_seconds": decode_meta["decode_seconds"],
                 "original_chars": len(original_text),
                 "decoded_chars": decode_meta["decoded_chars"],
+                "fallback_attempted": bool(encode_meta.get("used_oom_fallback", False)),
+                "attempt_count": 2 if bool(encode_meta.get("used_oom_fallback", False)) else 1,
                 "error": "",
             }
             rows.append(row)
 
-            if not keep_artifacts:
+            if not preserve_job_artifacts:
                 _cleanup_job_dir(job_dir)
         finally:
             # Always clear parent-process memory/cache before moving to next file,
