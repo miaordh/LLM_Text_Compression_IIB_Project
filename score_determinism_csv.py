@@ -20,7 +20,8 @@ def attach_determinism_score(df: pd.DataFrame) -> pd.DataFrame:
     if "status" not in df.columns:
         raise ValueError("CSV is missing required column: status")
 
-    valid_mask = df["status"].astype(str).eq("ok")
+    # Score all completed trials; only hard failures should be zeroed.
+    valid_mask = ~df["status"].astype(str).eq("error")
     quality_sum = pd.Series(0.0, index=df.index)
 
     for metric_name, weight in SCORE_METRICS:

@@ -34,7 +34,8 @@ def _attach_determinism_scores(rows: List[Dict[str, Any]]) -> List[Dict[str, Any
         return rows
 
     df = pd.DataFrame(rows)
-    valid_mask = df["status"].eq("ok")
+    # Score all completed trials; only hard failures should be zeroed.
+    valid_mask = ~df["status"].astype(str).eq("error")
 
     quality_sum = pd.Series(0.0, index=df.index)
     for metric_name, weight in _SCORE_METRICS:
