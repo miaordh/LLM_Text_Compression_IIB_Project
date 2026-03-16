@@ -12,11 +12,11 @@ from typing import Dict, List
 # ---------------------------
 # Drift search settings
 # ---------------------------
-MODEL_ID = "Qwen/Qwen2.5-0.5B"
+MODEL_ID = "deepseek-ai/deepseek-coder-1.3b-base"
 REVISION = None
 TRUST_REMOTE_CODE = False
 TORCH_DTYPE = "float16"  # auto | float32 | float16 | bfloat16
-DEVICE = "cuda"  # auto | cpu | cuda | mps
+DEVICE = "mps"  # auto | cpu | cuda | mps
 DEVICE_MODE = "cross_device"  # single_device | cross_device
 
 SAFE_MODE = True
@@ -29,15 +29,15 @@ PASS_REQUIRES_ZERO_CORRECTION = True
 CURRENT_FOLDER_TEXT_SELECTION = ["Shall I Compare Thee To a Summer's Day.txt"]
 
 # Search grid knobs
-DETERMINISM_MODES = [None, "batch_invariant_ops", "tbik"]
-QUANT_VALUES = [False, True]
-SLOTS_VALUES = [1 << 24, 1 << 22, 1 << 20]
+DETERMINISM_MODES = [None]
+QUANT_VALUES = [True]
+SLOTS_VALUES = [1 << 15]
 # Pair logit/prob rounding together to reduce the search loop depth.
 # Format: (logit_round_decimals, prob_round_decimals)
 ROUNDING_PAIRS = [
-    (15, 3),
     (10, 2),
     (5, 1),
+    (5, 0),
 ]
 
 # Codec behavior knobs
@@ -134,6 +134,7 @@ def main():
     config = {
         "files": files,
         "trials": trials,
+        "model_name": MODEL_ID,
         "settings": {
             "model_id": MODEL_ID,
             "revision": REVISION,

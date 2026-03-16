@@ -11,22 +11,35 @@ from typing import List
 # ---------------------------
 # Runner settings (edit me)
 # ---------------------------
-MODEL_ID = "Qwen/Qwen2.5-0.5B"
+# Tokenizer settings for local token-ID mapping.
+# For qwen-tokenizer backend, use values from qwen_tokenizer.list_tokenizers().
+TOKENIZER_BACKEND = "qwen_tokenizer"  # qwen_tokenizer | huggingface
+TOKENIZER_NAME = "qwen-plus"
+
+# Optional Hugging Face tokenizer fallback (used only when TOKENIZER_BACKEND='huggingface').
+TOKENIZER_MODEL_ID = "Qwen/Qwen2.5-0.5B"
 REVISION = None
 TRUST_REMOTE_CODE = False
-TORCH_DTYPE = "float16"  # auto | float32 | float16 | bfloat16
-DEVICE = "cuda"  # auto | cpu | cuda | mps
-DEVICE_MODE = "cross_device"  # single_device | cross_device
 
-# Large-file safety knobs (used by worker):
-# - ignore_model_max_length_warning suppresses benign tokenizer warnings when
-#   full-file tokenization is intentional.
-# - enable_oom_fallback retries encode with smaller KV settings on CUDA OOM.
+# API model endpoint settings (Alibaba DashScope OpenAI-compatible endpoint).
+# Use a model known to work on DashScope intl endpoint by default.
+API_MODEL = "qwen-plus"
+API_BASE_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+# Leave None to read from DASHSCOPE_API_KEY/QWEN_API_KEY/OPENAI_API_KEY.
+API_KEY = None
+# Preferred environment variable for API key lookup in worker.
+API_KEY_ENV = "DASHSCOPE_API_KEY"
+API_TOP_K = 5
+API_TEMPERATURE = 0.0
+ENABLE_API_CACHE_HINTS = False
+API_ATTENTION_SINK = 4
+DETERMINISTIC_STRICT = True
+API_REQUEST_MODE = "chat"  # chat | completions | auto
+API_SEED = 1
+STRICT_SINGLE_ID_MAPPING = True
+CORRECTION_MODE = "off"  # off | token_backup
+
 IGNORE_MODEL_MAX_LENGTH_WARNING = True
-ENABLE_OOM_FALLBACK = True
-OOM_FALLBACK_STRATEGY = "block"  # rolling | block | no_kv_cache
-OOM_FALLBACK_CONTEXT_WINDOW = 128
-OOM_FALLBACK_MARGIN = 16
 
 SAFE_MODE = True
 PRECISION = 32
@@ -36,28 +49,19 @@ MARGIN = 128
 STRATEGY = "rolling"  # rolling | block | no_kv_cache
 USE_LEGACY_COUNTS = False
 QUANT = False
-LOGIT_ROUND_DECIMALS = 15
-PROB_ROUND_DECIMALS = 1
-# None | batch_invariant_ops | tbik
-# In cross_device mode, worker encodes on CPU and decodes on accelerator.
-DETERMINISM_MODE = "tbik"
+LOGIT_ROUND_DECIMALS = 2
+PROB_ROUND_DECIMALS = 5
 MAX_DECODE_TOKENS = None
 DIAGNOSTICS_ENABLED = True
-# Optional diagnostics CSV prefix. If None and diagnostics is enabled, worker writes
-# per-file CSVs under that file's artifact directory.
 DIAGNOSTICS_CSV_PREFIX = None
 
 TEXT_ENCODING = "utf-8"
-# Optional per-file text encoding overrides.
-# Keys can be bare filenames (e.g. "cp.html") or relative paths.
 FILE_ENCODING_OVERRIDES = {
     "cp.html": "windows-1252",
 }
 
 KEEP_ARTIFACTS = False
-PHASE_TIMEOUT_SECONDS = 18000 # 0 disables timeout
-# Per-file behavior: when True, a file stops immediately on encode/decode error,
-# but the run still continues with remaining files.
+PHASE_TIMEOUT_SECONDS = 18000  # 0 disables timeout
 STOP_ON_FILE_ERROR = True
 
 # Parallel-run safety:
@@ -69,22 +73,20 @@ RUN_TAG = None
 # - None: run nothing from CANTRBRY_DIR
 # - "all": run every file under CANTRBRY_DIR
 # - list[str]: explicit relative filenames under CANTRBRY_DIR
-# CANTRBRY_FILE_SELECTION = ["alice29.txt", "asyoulik.txt", "cp.html", "kennedy.xls", "lcet10.txt", "plrabn12.txt", "ptt5"]
 CANTRBRY_FILE_SELECTION = None
 
 # File selection for project root text files:
 # - None: run nothing from project root
 # - "all": run every .txt file directly under project root
 # - list[str]: explicit relative filenames under project root
-# CURRENT_FOLDER_TEXT_SELECTION = ["Shall I Compare Thee To a Summer's Day.txt", "再别康桥.txt"]
 CURRENT_FOLDER_TEXT_SELECTION = ["Shall I Compare Thee To a Summer's Day.txt"]
 # CURRENT_FOLDER_TEXT_SELECTION = None
 
 CANTRBRY_DIR = Path("cantrbry")
-OUTPUT_CSV = Path("deterministic_roundtrip_results.csv")
-WORKER_SCRIPT = Path("deterministic_roundtrip_worker.py")
-CONFIG_PATH = Path("deterministic_roundtrip_config.json")
-ARTIFACT_ROOT_BASE = Path(".roundtrip_artifacts")
+OUTPUT_CSV = Path("api_roundtrip_results.csv")
+WORKER_SCRIPT = Path("api_roundtrip_worker.py")
+CONFIG_PATH = Path("api_roundtrip_config.json")
+ARTIFACT_ROOT_BASE = Path(".api_roundtrip_artifacts")
 
 
 def _resolve_run_tag() -> str:
@@ -145,17 +147,13 @@ def main():
         raise RuntimeError("No files selected for round-trip test from either location.")
 
     settings = {
-        "model_id": MODEL_ID,
+        "model_id": TOKENIZER_MODEL_ID,
+        "tokenizer_model_id": TOKENIZER_MODEL_ID,
+        "tokenizer_backend": TOKENIZER_BACKEND,
+        "tokenizer_name": TOKENIZER_NAME,
         "revision": REVISION,
         "trust_remote_code": TRUST_REMOTE_CODE,
-        "torch_dtype": TORCH_DTYPE,
-        "device": DEVICE,
-        "device_mode": DEVICE_MODE,
         "ignore_model_max_length_warning": IGNORE_MODEL_MAX_LENGTH_WARNING,
-        "enable_oom_fallback": ENABLE_OOM_FALLBACK,
-        "oom_fallback_strategy": OOM_FALLBACK_STRATEGY,
-        "oom_fallback_context_window": OOM_FALLBACK_CONTEXT_WINDOW,
-        "oom_fallback_margin": OOM_FALLBACK_MARGIN,
         "safe_mode": SAFE_MODE,
         "precision": PRECISION,
         "slots": SLOTS,
@@ -166,7 +164,6 @@ def main():
         "quant": QUANT,
         "logit_round_decimals": LOGIT_ROUND_DECIMALS,
         "prob_round_decimals": PROB_ROUND_DECIMALS,
-        "determinism_mode": DETERMINISM_MODE,
         "max_decode_tokens": MAX_DECODE_TOKENS,
         "diagnostics_enabled": DIAGNOSTICS_ENABLED,
         "diagnostics_csv_prefix": DIAGNOSTICS_CSV_PREFIX,
@@ -175,6 +172,19 @@ def main():
         "keep_artifacts": KEEP_ARTIFACTS,
         "phase_timeout_seconds": PHASE_TIMEOUT_SECONDS,
         "stop_on_file_error": STOP_ON_FILE_ERROR,
+        "api_model": API_MODEL,
+        "api_base_url": API_BASE_URL,
+        "api_key": API_KEY,
+        "api_key_env": API_KEY_ENV,
+        "api_top_k": API_TOP_K,
+        "api_temperature": API_TEMPERATURE,
+        "enable_api_cache_hints": ENABLE_API_CACHE_HINTS,
+        "api_attention_sink": API_ATTENTION_SINK,
+        "deterministic_strict": DETERMINISTIC_STRICT,
+        "api_request_mode": API_REQUEST_MODE,
+        "api_seed": API_SEED,
+        "strict_single_id_mapping": STRICT_SINGLE_ID_MAPPING,
+        "correction_mode": CORRECTION_MODE,
     }
 
     output_csv_path = (project_root / _with_tag(OUTPUT_CSV, run_tag)).resolve()
@@ -184,7 +194,8 @@ def main():
     config = {
         "files": [str(p) for p in files],
         "settings": settings,
-        "model_name": MODEL_ID,
+        "model_name": API_MODEL,
+        "tokenizer_model_name": TOKENIZER_NAME if TOKENIZER_BACKEND == "qwen_tokenizer" else TOKENIZER_MODEL_ID,
         "output_csv": str(output_csv_path),
         "artifact_root": str(artifact_root),
         "run_tag": run_tag,

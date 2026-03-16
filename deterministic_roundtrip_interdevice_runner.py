@@ -250,6 +250,7 @@ def _run_encode_phase(project_root: Path, worker: Path, run_tag: str):
     config = {
         "files": [str(p) for p in files],
         "settings": settings,
+        "model_name": MODEL_ID,
         "output_csv": str(output_csv_path),
         "artifact_root": str(artifact_root),
         "run_tag": run_tag,
@@ -343,6 +344,7 @@ def _run_decode_phase(project_root: Path, worker: Path, run_tag: str):
 
     decode_config = dict(base_config)
     decode_config["settings"] = settings
+    decode_config["model_name"] = base_config.get("model_name", MODEL_ID)
     decode_config["output_csv"] = str(decode_csv_path)
     decode_config["decode_host"] = socket.gethostname()
     decode_config_path.write_text(json.dumps(decode_config, indent=2), encoding="utf-8")
