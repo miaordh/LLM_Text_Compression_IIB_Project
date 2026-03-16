@@ -1,6 +1,7 @@
 import argparse
 import gc
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -16,6 +17,63 @@ from llm_codec_drift_test import DriftAwareLLMCodec, DriftTestCodecConfig, clean
 if os.environ.get("TRANSFORMERS_CACHE") and not os.environ.get("HF_HOME"):
     os.environ["HF_HOME"] = os.environ["TRANSFORMERS_CACHE"]
     os.environ.pop("TRANSFORMERS_CACHE", None)
+
+
+_SCORE_METRICS = [
+    ("max_distance_D_to_reference_interval", 0.35),
+    ("mean_distance_D_to_reference_interval", 0.25),
+    ("mean_abs_interval_low_delta", 0.10),
+    ("mean_abs_interval_high_delta", 0.10),
+    ("drift_events", 0.10),
+    ("corrections_applied", 0.10),
+]
+
+
+def _attach_determinism_scores(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not rows:
+        return rows
+
+    df = pd.DataFrame(rows)
+    valid_mask = df["status"].eq("ok")
+
+    quality_sum = pd.Series(0.0, index=df.index)
+    for metric_name, weight in _SCORE_METRICS:
+        metric_raw = pd.to_numeric(df.get(metric_name), errors="coerce")
+        metric_log = metric_raw.clip(lower=0).map(lambda v: float("nan") if pd.isna(v) else float(math.log1p(v)))
+        valid_metric = metric_log[valid_mask]
+        min_v = valid_metric.min(skipna=True)
+        max_v = valid_metric.max(skipna=True)
+
+        if pd.isna(min_v) or pd.isna(max_v):
+            metric_quality = pd.Series(0.0, index=df.index)
+        elif max_v > min_v:
+            metric_quality = 1.0 - ((metric_log - min_v) / (max_v - min_v))
+            metric_quality = metric_quality.clip(lower=0.0, upper=1.0).fillna(0.0)
+        else:
+            metric_quality = pd.Series(1.0, index=df.index)
+
+        quality_sum += weight * metric_quality
+
+    decoded_match = pd.to_numeric(df.get("decoded_match"), errors="coerce").fillna(0.0)
+    zero_recenter = pd.to_numeric(df.get("zero_recenter"), errors="coerce").fillna(0.0)
+    strict_gate = ((decoded_match >= 1.0) & (zero_recenter >= 1.0)).astype(float)
+    base_score = 100.0 * quality_sum.clip(lower=0.0, upper=1.0)
+
+    # Strict pass gets full score. Non-strict rows remain comparable but down-weighted.
+    final_score = base_score * (0.35 + 0.65 * strict_gate)
+    final_score = final_score.where(valid_mask, 0.0)
+
+    df["determinism_score"] = final_score.round(4)
+    df["determinism_tier"] = pd.cut(
+        df["determinism_score"],
+        bins=[-0.001, 20, 40, 60, 80, 100],
+        labels=["very_low", "low", "medium", "high", "very_high"],
+    ).astype("string")
+
+    rank_series = df["determinism_score"].rank(method="min", ascending=False)
+    df["determinism_rank"] = rank_series.where(valid_mask).astype("Int64")
+
+    return df.to_dict(orient="records")
 
 
 def _resolve_device(device: str) -> str:
@@ -290,6 +348,8 @@ def main():
 
         for file_path in files:
             rows.append(_run_trial_on_file(trial, file_path, trial_dir, settings))
+
+    rows = _attach_determinism_scores(rows)
 
     pd.DataFrame(rows).to_csv(output_csv, index=False)
     print(f"Wrote search results to: {output_csv}")
