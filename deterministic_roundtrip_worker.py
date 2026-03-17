@@ -245,6 +245,10 @@ def _phase_encode(config: Dict[str, Any], file_path: Path, artifact_dir: Path):
     text_encoding = _encoding_for_file(settings, file_path)
     device_mode = _resolve_device_mode(settings)
     diagnostics_enabled = bool(settings.get("diagnostics_enabled", False))
+    demo_mode = bool(settings.get("demo_mode", False))
+    speed_demo = bool(settings.get("speed_demo", False))
+    memory_demo = bool(settings.get("memory_demo", False))
+    memory_sample_interval = float(settings.get("memory_sample_interval", 0.05))
 
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
@@ -274,6 +278,13 @@ def _phase_encode(config: Dict[str, Any], file_path: Path, artifact_dir: Path):
                 safe_mode=safe_mode,
                 return_token_count=safe_mode,
                 show_progress=False,
+                demo=demo_mode,
+                demo_csv_path=str(artifact_dir / "demo_encode.csv"),
+                speed_demo=speed_demo,
+                speed_csv_path=str(artifact_dir / "speed_encode.csv"),
+                memory_demo=memory_demo,
+                memory_csv_path=str(artifact_dir / "memory_encode.csv"),
+                memory_sample_interval=memory_sample_interval,
             )
             encode_seconds = time.time() - start
 
@@ -294,6 +305,11 @@ def _phase_encode(config: Dict[str, Any], file_path: Path, artifact_dir: Path):
                 "original_size_bytes": original_size_bytes,
                 "text_encoding": text_encoding,
                 "device_mode": device_mode,
+                "demo_mode": demo_mode,
+                "speed_demo": speed_demo,
+                "memory_demo": memory_demo,
+                "memory_sample_interval": memory_sample_interval,
+                "divergence_window": int(settings.get("divergence_window", 5)),
                 "effective_settings": {
                     "device": attempt_settings.get("device", "auto"),
                     "torch_dtype": attempt_settings.get("torch_dtype", "auto"),
@@ -333,6 +349,11 @@ def _phase_decode(config: Dict[str, Any], artifact_dir: Path):
     device_mode = _resolve_device_mode(settings)
     decode_device_override = settings.get("decode_device_override")
     diagnostics_enabled = bool(settings.get("diagnostics_enabled", False))
+    demo_mode = bool(settings.get("demo_mode", False))
+    speed_demo = bool(settings.get("speed_demo", False))
+    memory_demo = bool(settings.get("memory_demo", False))
+    memory_sample_interval = float(settings.get("memory_sample_interval", 0.05))
+    divergence_window = int(settings.get("divergence_window", 5))
 
     encode_meta_path = artifact_dir / "encode_metadata.json"
     encoded_path = artifact_dir / "encoded.bin"
@@ -344,6 +365,13 @@ def _phase_decode(config: Dict[str, Any], artifact_dir: Path):
     effective_settings = encode_meta.get("effective_settings")
     if isinstance(effective_settings, dict):
         settings.update(effective_settings)
+
+    # Preserve run-level demo settings even if encode metadata includes effective settings.
+    demo_mode = bool(encode_meta.get("demo_mode", demo_mode))
+    speed_demo = bool(encode_meta.get("speed_demo", speed_demo))
+    memory_demo = bool(encode_meta.get("memory_demo", memory_demo))
+    memory_sample_interval = float(encode_meta.get("memory_sample_interval", memory_sample_interval))
+    divergence_window = int(encode_meta.get("divergence_window", divergence_window))
 
     if device_mode == "cross_device":
         settings["device"] = _preferred_accelerator_device()
@@ -363,9 +391,34 @@ def _phase_decode(config: Dict[str, Any], artifact_dir: Path):
         decode_kwargs: Dict[str, Any] = {
             "max_decode_tokens": settings.get("max_decode_tokens"),
             "safe_mode": safe_mode,
+            "show_progress": False,
+            "demo": demo_mode,
+            "demo_csv_path": str(artifact_dir / "demo_decode.csv"),
+            "speed_demo": speed_demo,
+            "speed_csv_path": str(artifact_dir / "speed_decode.csv"),
+            "memory_demo": memory_demo,
+            "memory_csv_path": str(artifact_dir / "memory_decode.csv"),
+            "memory_sample_interval": memory_sample_interval,
+            "divergence_window": divergence_window,
         }
         if safe_mode:
             decode_kwargs["expected_num_tokens"] = int(encode_meta["num_tokens"])
+
+        # Demo mode includes forensic-style divergence reporting by comparing
+        # decoded tokens against reference tokenization of the original input.
+        if demo_mode:
+            input_file = encode_meta.get("input_file")
+            if input_file:
+                input_path = Path(str(input_file))
+                if input_path.exists() and input_path.is_file():
+                    source_text = _read_text(input_path, text_encoding)
+                    try:
+                        reference_ids = list(codec.tokenizer.encode(source_text, add_special_tokens=False))
+                    except TypeError:
+                        reference_ids = list(codec.tokenizer.encode(source_text))
+                    if not safe_mode:
+                        reference_ids = reference_ids + [int(codec.eof_token_id)]
+                    decode_kwargs["reference_token_ids"] = reference_ids
 
         start = time.time()
         decoded_text = codec.decode(encoded_bytes, **decode_kwargs)
@@ -376,6 +429,9 @@ def _phase_decode(config: Dict[str, Any], artifact_dir: Path):
         decode_meta = {
             "decode_seconds": decode_seconds,
             "decoded_chars": len(decoded_text),
+            "demo_mode": demo_mode,
+            "speed_demo": speed_demo,
+            "memory_demo": memory_demo,
         }
         (artifact_dir / "decode_metadata.json").write_text(json.dumps(decode_meta, indent=2), encoding="utf-8")
     finally:

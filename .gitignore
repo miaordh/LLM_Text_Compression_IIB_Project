@@ -24,3 +24,5 @@ drift_search_results*.csv
 api_roundtrip_config*.json
 api_roundtrip_results*.csv
 .api_roundtrip_artifacts/
+results/
+old_results/

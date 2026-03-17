@@ -26,7 +26,19 @@ TEXT_ENCODING = "utf-8"
 PASS_REQUIRES_ZERO_CORRECTION = True
 
 # Dataset selection
-CURRENT_FOLDER_TEXT_SELECTION = ["Shall I Compare Thee To a Summer's Day.txt"]
+CURRENT_FOLDER_TEXT_SELECTION = ["my_corpus/Shall I Compare Thee To a Summer's Day.txt"]
+
+# File selection for my_corpus:
+# - None: run nothing from MY_CORPUS_DIR
+# - "all": run every .txt file under MY_CORPUS_DIR
+# - list[str]: explicit filenames relative to MY_CORPUS_DIR
+MY_CORPUS_FILE_SELECTION = None
+
+# File selection for artificial_corpus:
+# - None: run nothing from ARTIFICIAL_CORPUS_DIR
+# - "all": run every .txt file under ARTIFICIAL_CORPUS_DIR
+# - list[str]: explicit filenames relative to ARTIFICIAL_CORPUS_DIR
+ARTIFICIAL_CORPUS_FILE_SELECTION = None
 
 # Search grid knobs
 DETERMINISM_MODES = [None]
@@ -52,10 +64,12 @@ EMIT_FULL_REFERENCE_TRACE = True
 # Optional cap for quick experiments
 MAX_TRIALS = None
 
-OUTPUT_CSV = Path("drift_search_results.csv")
-CONFIG_PATH = Path("drift_search_config.json")
+OUTPUT_CSV = Path("results/drift_search/drift_search_results.csv")
+CONFIG_PATH = Path("results/drift_search/drift_search_config.json")
 WORKER_SCRIPT = Path("drift_search_worker.py")
 ARTIFACT_ROOT_BASE = Path(".drift_search_artifacts")
+MY_CORPUS_DIR = Path("my_corpus")
+ARTIFICIAL_CORPUS_DIR = Path("artificial_corpus")
 
 
 def _resolve_run_tag() -> str:
@@ -64,6 +78,30 @@ def _resolve_run_tag() -> str:
 
 def _with_tag(path: Path, run_tag: str) -> Path:
     return path.with_name(f"{path.stem}_{run_tag}{path.suffix}")
+
+
+def _select_files(base_dir: Path, selection, txt_only: bool = False) -> List[Path]:
+    if selection is None:
+        return []
+
+    if selection == "all":
+        all_files = [p for p in base_dir.iterdir() if p.is_file()]
+        if txt_only:
+            all_files = [p for p in all_files if p.suffix.lower() == ".txt"]
+        return sorted(all_files)
+
+    if not isinstance(selection, list):
+        raise ValueError("Selection must be None, 'all', or a list of filenames.")
+
+    selected = []
+    for rel in selection:
+        candidate = (base_dir / rel).resolve()
+        if not candidate.exists() or not candidate.is_file():
+            raise FileNotFoundError(f"Selected file does not exist: {candidate}")
+        if txt_only and candidate.suffix.lower() != ".txt":
+            raise ValueError(f"Selected file is not a .txt file: {candidate}")
+        selected.append(candidate)
+    return selected
 
 
 def _build_trials() -> List[Dict]:
@@ -111,17 +149,30 @@ def _build_trials() -> List[Dict]:
 def main():
     project_root = Path(__file__).resolve().parent
     run_tag = _resolve_run_tag()
+    my_corpus_dir = (project_root / MY_CORPUS_DIR).resolve()
+    artificial_corpus_dir = (project_root / ARTIFICIAL_CORPUS_DIR).resolve()
 
     worker = (project_root / WORKER_SCRIPT).resolve()
     if not worker.exists():
         raise FileNotFoundError(f"Worker script not found: {worker}")
 
-    files = []
-    for rel in CURRENT_FOLDER_TEXT_SELECTION:
-        p = (project_root / rel).resolve()
-        if not p.exists() or not p.is_file():
-            raise FileNotFoundError(f"Selected file not found: {p}")
-        files.append(str(p))
+    if MY_CORPUS_FILE_SELECTION is not None:
+        if not my_corpus_dir.exists() or not my_corpus_dir.is_dir():
+            raise FileNotFoundError(f"my_corpus folder not found: {my_corpus_dir}")
+    if ARTIFICIAL_CORPUS_FILE_SELECTION is not None:
+        if not artificial_corpus_dir.exists() or not artificial_corpus_dir.is_dir():
+            raise FileNotFoundError(f"artificial_corpus folder not found: {artificial_corpus_dir}")
+
+    current_folder_files = _select_files(project_root, CURRENT_FOLDER_TEXT_SELECTION, txt_only=True)
+    my_corpus_files = _select_files(my_corpus_dir, MY_CORPUS_FILE_SELECTION, txt_only=True)
+    artificial_corpus_files = _select_files(
+        artificial_corpus_dir,
+        ARTIFICIAL_CORPUS_FILE_SELECTION,
+        txt_only=True,
+    )
+    files = [str(p) for p in sorted(set(current_folder_files + my_corpus_files + artificial_corpus_files))]
+    if not files:
+        raise RuntimeError("No files selected for drift search.")
 
     trials = _build_trials()
     if not trials:
@@ -130,6 +181,8 @@ def main():
     output_csv_path = (project_root / _with_tag(OUTPUT_CSV, run_tag)).resolve()
     config_path = (project_root / _with_tag(CONFIG_PATH, run_tag)).resolve()
     artifact_root = (project_root / ARTIFACT_ROOT_BASE / run_tag).resolve()
+    output_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
 
     config = {
         "files": files,

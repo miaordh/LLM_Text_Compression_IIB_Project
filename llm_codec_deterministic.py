@@ -4,10 +4,12 @@ import importlib
 import math
 import os
 import sys
+import threading
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -778,12 +780,196 @@ class DeterministicLLMCodec:
             return probs_to_counts_legacy(probs, self.config.slots, self.dec_prec)
         return probs_to_counts(probs, self.config.slots, self.dec_prec)
 
+    @staticmethod
+    def _write_csv_rows(path: str, rows: List[Dict[str, Any]]):
+        if not rows:
+            return
+        out_path = Path(path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with out_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def _start_memory_monitor(self, enabled: bool, sample_interval: float):
+        if not enabled:
+            return None
+
+        try:
+            import psutil
+        except Exception:
+            return None
+
+        stop_event = threading.Event()
+        rows: List[Dict[str, float]] = []
+        process = psutil.Process(os.getpid())
+        start_time = time.perf_counter()
+        has_cuda = torch.cuda.is_available()
+        has_mps = bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
+
+        mps_alloc_fn = None
+        if has_mps and hasattr(torch, "mps"):
+            mps_alloc_fn = getattr(torch.mps, "current_allocated_memory", None)
+
+        def _monitor():
+            while not stop_event.is_set():
+                try:
+                    mem_info = process.memory_info()
+                    cuda_allocated_mb = ""
+                    cuda_reserved_mb = ""
+                    mps_allocated_mb = ""
+                    vram_mb = ""
+
+                    if has_cuda:
+                        try:
+                            cuda_allocated_mb = float(torch.cuda.memory_allocated()) / (1024.0 * 1024.0)
+                            cuda_reserved_mb = float(torch.cuda.memory_reserved()) / (1024.0 * 1024.0)
+                            vram_mb = cuda_allocated_mb
+                        except Exception:
+                            pass
+
+                    if has_mps and mps_alloc_fn is not None:
+                        try:
+                            mps_allocated_mb = float(mps_alloc_fn()) / (1024.0 * 1024.0)
+                            if vram_mb == "":
+                                vram_mb = mps_allocated_mb
+                        except Exception:
+                            pass
+
+                    rows.append(
+                        {
+                            "time": time.perf_counter() - start_time,
+                            "rss_mb": float(mem_info.rss) / (1024.0 * 1024.0),
+                            "vms_mb": float(mem_info.vms) / (1024.0 * 1024.0),
+                            "vram_mb": vram_mb,
+                            "cuda_allocated_mb": cuda_allocated_mb,
+                            "cuda_reserved_mb": cuda_reserved_mb,
+                            "mps_allocated_mb": mps_allocated_mb,
+                        }
+                    )
+                except Exception:
+                    break
+                time.sleep(max(0.01, float(sample_interval)))
+
+        thread = threading.Thread(target=_monitor, daemon=True)
+        thread.start()
+        return {"stop_event": stop_event, "thread": thread, "rows": rows}
+
+    def _stop_memory_monitor(self, monitor_state, speed_rows: List[Dict[str, Any]]):
+        if monitor_state is None:
+            return []
+
+        monitor_state["stop_event"].set()
+        monitor_state["thread"].join()
+        rows = monitor_state["rows"]
+        if not rows:
+            return []
+
+        if speed_rows:
+            elapsed = np.cumsum([float(row["time"]) for row in speed_rows])
+            pos = np.asarray([float(row["pos"]) for row in speed_rows], dtype=np.float64)
+            for row in rows:
+                row["aligned_pos"] = float(np.interp(float(row["time"]), elapsed, pos))
+        else:
+            for row in rows:
+                row["aligned_pos"] = ""
+
+        return rows
+
+    def _maybe_write_divergence_rows(
+        self,
+        demo_csv_path: str,
+        decoded_ids: Sequence[int],
+        reference_token_ids: Optional[Sequence[int]],
+        divergence_window: int,
+    ):
+        if reference_token_ids is None:
+            return
+
+        reference_ids = [int(x) for x in reference_token_ids]
+        decoded = [int(x) for x in decoded_ids]
+        compare_len = min(len(decoded), len(reference_ids))
+
+        first_div_idx = None
+        for idx in range(compare_len):
+            if decoded[idx] != reference_ids[idx]:
+                first_div_idx = idx
+                break
+
+        if first_div_idx is None and len(decoded) != len(reference_ids):
+            first_div_idx = compare_len
+
+        rows: List[Dict[str, Any]] = []
+        if first_div_idx is None:
+            rows.append(
+                {
+                    "segment": "summary",
+                    "step_idx": "",
+                    "reference_token_id": "",
+                    "reference_token_text": "",
+                    "decoded_token_id": "",
+                    "decoded_token_text": "",
+                    "match": 1,
+                    "note": "No divergence detected in compared token sequence.",
+                }
+            )
+        else:
+            start_match = max(0, first_div_idx - int(max(1, divergence_window)))
+            for idx in range(start_match, first_div_idx):
+                ref_id = reference_ids[idx]
+                dec_id = decoded[idx]
+                rows.append(
+                    {
+                        "segment": "last_matching",
+                        "step_idx": idx,
+                        "reference_token_id": ref_id,
+                        "reference_token_text": self._token_text_for_diag(self.tokenizer, ref_id),
+                        "decoded_token_id": dec_id,
+                        "decoded_token_text": self._token_text_for_diag(self.tokenizer, dec_id),
+                        "match": int(ref_id == dec_id),
+                        "note": "",
+                    }
+                )
+
+            max_len = max(len(decoded), len(reference_ids))
+            end_div = min(max_len, first_div_idx + int(max(1, divergence_window)))
+            for idx in range(first_div_idx, end_div):
+                ref_id = reference_ids[idx] if idx < len(reference_ids) else None
+                dec_id = decoded[idx] if idx < len(decoded) else None
+                rows.append(
+                    {
+                        "segment": "first_diverged",
+                        "step_idx": idx,
+                        "reference_token_id": "" if ref_id is None else ref_id,
+                        "reference_token_text": ""
+                        if ref_id is None
+                        else self._token_text_for_diag(self.tokenizer, ref_id),
+                        "decoded_token_id": "" if dec_id is None else dec_id,
+                        "decoded_token_text": ""
+                        if dec_id is None
+                        else self._token_text_for_diag(self.tokenizer, dec_id),
+                        "match": int(ref_id is not None and dec_id is not None and ref_id == dec_id),
+                        "note": "",
+                    }
+                )
+
+        divergence_path = Path(demo_csv_path)
+        divergence_path = divergence_path.with_name(f"{divergence_path.stem}_divergence.csv")
+        self._write_csv_rows(str(divergence_path), rows)
+
     def encode(
         self,
         text: str,
         safe_mode: bool = False,
         return_token_count: bool = False,
         show_progress: bool = True,
+        demo: bool = False,
+        demo_csv_path: str = "compression_stats.csv",
+        speed_demo: bool = False,
+        speed_csv_path: str = "speed_encode.csv",
+        memory_demo: bool = False,
+        memory_csv_path: str = "memory_encode.csv",
+        memory_sample_interval: float = 0.05,
     ):
         token_ids = self.tokenizer.encode(text)
         if not safe_mode:
@@ -797,6 +983,9 @@ class DeterministicLLMCodec:
 
         cache_state = self._init_cache_state()
         diag_handle, diag_writer = self._open_diagnostics_writer("encode")
+        demo_rows: List[Dict[str, Any]] = []
+        speed_rows: List[Dict[str, Any]] = []
+        monitor_state = self._start_memory_monitor(memory_demo, memory_sample_interval)
 
         try:
             with self._invariant_context():
@@ -805,6 +994,7 @@ class DeterministicLLMCodec:
                     cache_state["next_logits"] = self._get_logits(0, token_ids, cache_state)
 
                 for idx, token_id in iterator:
+                    iter_start = time.perf_counter()
                     if self.config.strategy == "block" and idx > 0 and (idx % self.block_stride == 0):
                         cache_state = self._hard_reset_cache_and_warmup(
                             token_ids,
@@ -815,6 +1005,22 @@ class DeterministicLLMCodec:
                     logits = self._get_logits(idx, token_ids, cache_state)
                     raw_probs, probs = self._raw_and_effective_probs(logits)
                     counts = self._counts_from_probs(probs)
+
+                    if demo:
+                        p_raw = float(raw_probs[int(token_id)])
+                        p_eff = float(probs[int(token_id)])
+                        safe_raw = max(p_raw, 1e-12)
+                        demo_rows.append(
+                            {
+                                "pos": int(idx),
+                                "token_id": int(token_id),
+                                "token": self._token_text_for_diag(self.tokenizer, int(token_id)),
+                                "prob_raw": p_raw,
+                                "prob_effective": p_eff,
+                                "perplexity_raw": 1.0 / safe_raw,
+                                "surprisal_bits_raw": -math.log2(safe_raw),
+                            }
+                        )
 
                     coder_L_before = int(enc.coder.L)
                     coder_R_before = int(enc.coder.R)
@@ -841,13 +1047,24 @@ class DeterministicLLMCodec:
                             > (self.config.context_window + self.config.margin)
                         ):
                             cache_state = self._truncate_cache_rolling(cache_state)
+
+                    if speed_demo or memory_demo:
+                        speed_rows.append({"pos": int(idx), "time": time.perf_counter() - iter_start})
         finally:
             if diag_handle is not None:
                 diag_handle.close()
+            if memory_demo:
+                memory_rows = self._stop_memory_monitor(monitor_state, speed_rows)
+                self._write_csv_rows(memory_csv_path, memory_rows)
 
         enc.finish()
         writer.flush()
         encoded_bytes = writer.getvalue()
+
+        if speed_demo:
+            self._write_csv_rows(speed_csv_path, speed_rows)
+        if demo:
+            self._write_csv_rows(demo_csv_path, demo_rows)
 
         if safe_mode or return_token_count:
             return encoded_bytes, len(token_ids)
@@ -860,11 +1077,24 @@ class DeterministicLLMCodec:
         safe_mode: bool = False,
         expected_num_tokens: Optional[int] = None,
         show_progress: bool = True,
+        demo: bool = False,
+        demo_csv_path: str = "demo_decode.csv",
+        speed_demo: bool = False,
+        speed_csv_path: str = "speed_decode.csv",
+        memory_demo: bool = False,
+        memory_csv_path: str = "memory_decode.csv",
+        memory_sample_interval: float = 0.05,
+        reference_token_ids: Optional[Sequence[int]] = None,
+        divergence_window: int = 5,
     ) -> str:
         dec = Decoder(Coder(b=self.config.precision), BitReader(encoded_bytes))
         decoded_ids = []
         cache_state = self._init_cache_state()
         diag_handle, diag_writer = self._open_diagnostics_writer("decode")
+        demo_rows: List[Dict[str, Any]] = []
+        speed_rows: List[Dict[str, Any]] = []
+        monitor_state = self._start_memory_monitor(memory_demo, memory_sample_interval)
+        decoded_text = ""
 
         if safe_mode and expected_num_tokens is None:
             raise ValueError("safe_mode=True requires expected_num_tokens to be provided.")
@@ -882,6 +1112,7 @@ class DeterministicLLMCodec:
                         iterator = tqdm(iterator, total=target_tokens, desc="Deterministic Decode")
 
                     for _ in iterator:
+                        iter_start = time.perf_counter()
                         idx = len(decoded_ids)
                         if max_decode_tokens is not None and idx >= max_decode_tokens:
                             raise RuntimeError(
@@ -917,6 +1148,26 @@ class DeterministicLLMCodec:
                             coder_D_before=coder_D_before,
                         )
 
+                        if demo:
+                            p_raw = float(raw_probs[int(token_id)])
+                            p_eff = float(probs[int(token_id)])
+                            safe_raw = max(p_raw, 1e-12)
+                            row: Dict[str, Any] = {
+                                "pos": int(idx),
+                                "decoded_token_id": int(token_id),
+                                "decoded_token": self._token_text_for_diag(self.tokenizer, int(token_id)),
+                                "prob_raw": p_raw,
+                                "prob_effective": p_eff,
+                                "perplexity_raw": 1.0 / safe_raw,
+                                "surprisal_bits_raw": -math.log2(safe_raw),
+                            }
+                            if reference_token_ids is not None and idx < len(reference_token_ids):
+                                ref_id = int(reference_token_ids[idx])
+                                row["reference_token_id"] = ref_id
+                                row["reference_token"] = self._token_text_for_diag(self.tokenizer, ref_id)
+                                row["match"] = int(ref_id == int(token_id))
+                            demo_rows.append(row)
+
                         decoded_ids.append(token_id)
 
                         cache_state = self._advance_state(token_id, cache_state)
@@ -927,65 +1178,108 @@ class DeterministicLLMCodec:
                         ):
                             cache_state = self._truncate_cache_rolling(cache_state)
 
-                    return self.tokenizer.decode(decoded_ids, skip_special_tokens=True)
+                        if speed_demo or memory_demo:
+                            speed_rows.append({"pos": int(idx), "time": time.perf_counter() - iter_start})
 
-                token_id = None
-                decode_iterator = None
-                if show_progress:
-                    decode_iterator = tqdm(desc="Deterministic Decode", unit="tok")
-                while token_id != self.eof_token_id:
-                    idx = len(decoded_ids)
-                    if max_decode_tokens is not None and idx >= max_decode_tokens:
-                        raise RuntimeError(
-                            f"Decoding exceeded max_decode_tokens={max_decode_tokens} before EOF."
+                    decoded_text = self.tokenizer.decode(decoded_ids, skip_special_tokens=True)
+                else:
+                    token_id = None
+                    decode_iterator = None
+                    if show_progress:
+                        decode_iterator = tqdm(desc="Deterministic Decode", unit="tok")
+                    while token_id != self.eof_token_id:
+                        iter_start = time.perf_counter()
+                        idx = len(decoded_ids)
+                        if max_decode_tokens is not None and idx >= max_decode_tokens:
+                            raise RuntimeError(
+                                f"Decoding exceeded max_decode_tokens={max_decode_tokens} before EOF."
+                            )
+
+                        if self.config.strategy == "block" and idx > 0 and (idx % self.block_stride == 0):
+                            cache_state = self._hard_reset_cache_and_warmup(
+                                decoded_ids,
+                                current_index=idx,
+                                warmup_length=self.config.margin,
+                            )
+
+                        logits = self._get_logits(idx, decoded_ids, cache_state)
+                        raw_probs, probs = self._raw_and_effective_probs(logits)
+                        counts = self._counts_from_probs(probs)
+
+                        coder_L_before = int(dec.coder.L)
+                        coder_R_before = int(dec.coder.R)
+                        coder_D_before = int(dec.coder.D)
+                        token_id = dec.decode_symbol(counts_to_cum_desc(counts))
+
+                        self._write_token_diagnostic(
+                            diag_writer,
+                            phase="decode",
+                            step_idx=idx,
+                            token_id=int(token_id),
+                            raw_probs=raw_probs,
+                            effective_probs=probs,
+                            counts=counts,
+                            coder_L_before=coder_L_before,
+                            coder_R_before=coder_R_before,
+                            coder_D_before=coder_D_before,
                         )
 
-                    if self.config.strategy == "block" and idx > 0 and (idx % self.block_stride == 0):
-                        cache_state = self._hard_reset_cache_and_warmup(
-                            decoded_ids,
-                            current_index=idx,
-                            warmup_length=self.config.margin,
-                        )
+                        if demo:
+                            p_raw = float(raw_probs[int(token_id)])
+                            p_eff = float(probs[int(token_id)])
+                            safe_raw = max(p_raw, 1e-12)
+                            row = {
+                                "pos": int(idx),
+                                "decoded_token_id": int(token_id),
+                                "decoded_token": self._token_text_for_diag(self.tokenizer, int(token_id)),
+                                "prob_raw": p_raw,
+                                "prob_effective": p_eff,
+                                "perplexity_raw": 1.0 / safe_raw,
+                                "surprisal_bits_raw": -math.log2(safe_raw),
+                            }
+                            if reference_token_ids is not None and idx < len(reference_token_ids):
+                                ref_id = int(reference_token_ids[idx])
+                                row["reference_token_id"] = ref_id
+                                row["reference_token"] = self._token_text_for_diag(self.tokenizer, ref_id)
+                                row["match"] = int(ref_id == int(token_id))
+                            demo_rows.append(row)
 
-                    logits = self._get_logits(idx, decoded_ids, cache_state)
-                    raw_probs, probs = self._raw_and_effective_probs(logits)
-                    counts = self._counts_from_probs(probs)
+                        decoded_ids.append(token_id)
 
-                    coder_L_before = int(dec.coder.L)
-                    coder_R_before = int(dec.coder.R)
-                    coder_D_before = int(dec.coder.D)
-                    token_id = dec.decode_symbol(counts_to_cum_desc(counts))
+                        if token_id != self.eof_token_id:
+                            cache_state = self._advance_state(token_id, cache_state)
+                            if (
+                                self.config.strategy == "rolling"
+                                and cache_state["cached_token_count"]
+                                > (self.config.context_window + self.config.margin)
+                            ):
+                                cache_state = self._truncate_cache_rolling(cache_state)
+                        if decode_iterator is not None:
+                            decode_iterator.update(1)
 
-                    self._write_token_diagnostic(
-                        diag_writer,
-                        phase="decode",
-                        step_idx=idx,
-                        token_id=int(token_id),
-                        raw_probs=raw_probs,
-                        effective_probs=probs,
-                        counts=counts,
-                        coder_L_before=coder_L_before,
-                        coder_R_before=coder_R_before,
-                        coder_D_before=coder_D_before,
-                    )
+                        if speed_demo or memory_demo:
+                            speed_rows.append({"pos": int(idx), "time": time.perf_counter() - iter_start})
 
-                    decoded_ids.append(token_id)
-
-                    if token_id != self.eof_token_id:
-                        cache_state = self._advance_state(token_id, cache_state)
-                        if (
-                            self.config.strategy == "rolling"
-                            and cache_state["cached_token_count"]
-                            > (self.config.context_window + self.config.margin)
-                        ):
-                            cache_state = self._truncate_cache_rolling(cache_state)
                     if decode_iterator is not None:
-                        decode_iterator.update(1)
+                        decode_iterator.close()
 
-                if decode_iterator is not None:
-                    decode_iterator.close()
+                    decoded_text = self.tokenizer.decode(decoded_ids[:-1], skip_special_tokens=True)
         finally:
             if diag_handle is not None:
                 diag_handle.close()
+            if memory_demo:
+                memory_rows = self._stop_memory_monitor(monitor_state, speed_rows)
+                self._write_csv_rows(memory_csv_path, memory_rows)
 
-        return self.tokenizer.decode(decoded_ids[:-1], skip_special_tokens=True)
+        if speed_demo:
+            self._write_csv_rows(speed_csv_path, speed_rows)
+        if demo:
+            self._write_csv_rows(demo_csv_path, demo_rows)
+            self._maybe_write_divergence_rows(
+                demo_csv_path=demo_csv_path,
+                decoded_ids=decoded_ids,
+                reference_token_ids=reference_token_ids,
+                divergence_window=divergence_window,
+            )
+
+        return decoded_text

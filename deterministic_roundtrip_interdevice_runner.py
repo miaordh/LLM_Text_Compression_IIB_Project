@@ -56,6 +56,14 @@ DIAGNOSTICS_ENABLED = False
 # per-file CSVs under that file's artifact directory.
 DIAGNOSTICS_CSV_PREFIX = None
 
+# Optional demo modes in llm_codec_deterministic.
+# When enabled, worker writes per-file CSVs under each file artifact directory.
+DEMO_MODE = False
+SPEED_DEMO = False
+MEMORY_DEMO = False
+MEMORY_SAMPLE_INTERVAL = 0.05
+DIVERGENCE_WINDOW = 5
+
 TEXT_ENCODING = "utf-8"
 FILE_ENCODING_OVERRIDES = {
     "cp.html": "windows-1252",
@@ -69,13 +77,17 @@ STOP_ON_FILE_ERROR = True
 # Encode-side file selection:
 CANTRBRY_FILE_SELECTION = None
 CURRENT_FOLDER_TEXT_SELECTION = None
+MY_CORPUS_FILE_SELECTION = None
+ARTIFICIAL_CORPUS_FILE_SELECTION = None
 
 CANTRBRY_DIR = Path("cantrbry")
-OUTPUT_CSV_ENCODE = Path("deterministic_roundtrip_encode_results.csv")
-OUTPUT_CSV_DECODE = Path("deterministic_roundtrip_decode_results.csv")
+MY_CORPUS_DIR = Path("my_corpus")
+ARTIFICIAL_CORPUS_DIR = Path("artificial_corpus")
+OUTPUT_CSV_ENCODE = Path("results/roundtrip/deterministic_roundtrip_encode_results.csv")
+OUTPUT_CSV_DECODE = Path("results/roundtrip/deterministic_roundtrip_decode_results.csv")
 WORKER_SCRIPT = Path("deterministic_roundtrip_worker.py")
-CONFIG_PATH = Path("deterministic_roundtrip_config.json")
-DECODE_CONFIG_PATH = Path("deterministic_roundtrip_decode_config.json")
+CONFIG_PATH = Path("results/roundtrip/deterministic_roundtrip_config.json")
+DECODE_CONFIG_PATH = Path("results/roundtrip/deterministic_roundtrip_decode_config.json")
 ARTIFACT_ROOT_BASE = Path(".roundtrip_artifacts")
 ENCODE_ATTEMPT_MARKER = "__ROUNDTRIP_ENCODE_ATTEMPT__"
 
@@ -222,6 +234,11 @@ def _build_settings() -> Dict[str, Any]:
         "max_decode_tokens": MAX_DECODE_TOKENS,
         "diagnostics_enabled": DIAGNOSTICS_ENABLED,
         "diagnostics_csv_prefix": DIAGNOSTICS_CSV_PREFIX,
+        "demo_mode": DEMO_MODE,
+        "speed_demo": SPEED_DEMO,
+        "memory_demo": MEMORY_DEMO,
+        "memory_sample_interval": MEMORY_SAMPLE_INTERVAL,
+        "divergence_window": DIVERGENCE_WINDOW,
         "text_encoding": TEXT_ENCODING,
         "file_encoding_overrides": FILE_ENCODING_OVERRIDES,
         "keep_artifacts": KEEP_ARTIFACTS,
@@ -232,13 +249,34 @@ def _build_settings() -> Dict[str, Any]:
 
 def _run_encode_phase(project_root: Path, worker: Path, run_tag: str):
     cantrbry_dir = (project_root / CANTRBRY_DIR).resolve()
+    my_corpus_dir = (project_root / MY_CORPUS_DIR).resolve()
+    artificial_corpus_dir = (project_root / ARTIFICIAL_CORPUS_DIR).resolve()
     if CANTRBRY_FILE_SELECTION is not None:
         if not cantrbry_dir.exists() or not cantrbry_dir.is_dir():
             raise FileNotFoundError(f"Cantrbry folder not found: {cantrbry_dir}")
+    if MY_CORPUS_FILE_SELECTION is not None:
+        if not my_corpus_dir.exists() or not my_corpus_dir.is_dir():
+            raise FileNotFoundError(f"my_corpus folder not found: {my_corpus_dir}")
+    if ARTIFICIAL_CORPUS_FILE_SELECTION is not None:
+        if not artificial_corpus_dir.exists() or not artificial_corpus_dir.is_dir():
+            raise FileNotFoundError(f"artificial_corpus folder not found: {artificial_corpus_dir}")
 
     cantrbry_files = _select_files(cantrbry_dir, CANTRBRY_FILE_SELECTION)
+    my_corpus_files = _select_files(my_corpus_dir, MY_CORPUS_FILE_SELECTION, txt_only=True)
+    artificial_corpus_files = _select_files(
+        artificial_corpus_dir,
+        ARTIFICIAL_CORPUS_FILE_SELECTION,
+        txt_only=True,
+    )
     current_folder_text_files = _select_files(project_root, CURRENT_FOLDER_TEXT_SELECTION, txt_only=True)
-    files = sorted(set(cantrbry_files + current_folder_text_files))
+    files = sorted(
+        set(
+            cantrbry_files
+            + my_corpus_files
+            + artificial_corpus_files
+            + current_folder_text_files
+        )
+    )
     if not files:
         raise RuntimeError("No files selected for encode phase.")
 
@@ -255,6 +293,8 @@ def _run_encode_phase(project_root: Path, worker: Path, run_tag: str):
         "artifact_root": str(artifact_root),
         "run_tag": run_tag,
     }
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    output_csv_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
     rows = []
@@ -347,6 +387,8 @@ def _run_decode_phase(project_root: Path, worker: Path, run_tag: str):
     decode_config["model_name"] = base_config.get("model_name", MODEL_ID)
     decode_config["output_csv"] = str(decode_csv_path)
     decode_config["decode_host"] = socket.gethostname()
+    decode_config_path.parent.mkdir(parents=True, exist_ok=True)
+    decode_csv_path.parent.mkdir(parents=True, exist_ok=True)
     decode_config_path.write_text(json.dumps(decode_config, indent=2), encoding="utf-8")
 
     artifact_root = Path(base_config.get("artifact_root", str(project_root / ARTIFACT_ROOT_BASE / run_tag)))

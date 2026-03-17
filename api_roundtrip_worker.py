@@ -1,12 +1,10 @@
 import argparse
-import array
 import hashlib
 import json
 import os
 import subprocess
 import sys
 import time
-import zlib
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -15,8 +13,6 @@ import pandas as pd
 from llm_codec_api import APICodecConfig, APILLMCodec
 
 ARTIFACT_ROOT = Path(".api_roundtrip_artifacts")
-CORRECTION_MODE_NONE = "off"
-CORRECTION_MODE_TOKEN_BACKUP = "token_backup"
 
 
 def _read_text(path: Path, encoding: str) -> str:
@@ -63,29 +59,6 @@ def _tokenizer_vocab_size(tokenizer) -> int:
     raise RuntimeError(
         "Could not determine tokenizer vocab size for slot validation."
     )
-
-
-def _build_token_backup_payload(codec: APILLMCodec, text: str, safe_mode: bool) -> bytes:
-    token_ids = codec._encode_text(text)
-    if not safe_mode:
-        token_ids = token_ids + [int(codec.eof_token_id)]
-
-    packed = array.array("I", [int(t) for t in token_ids]).tobytes()
-    raw_payload = len(token_ids).to_bytes(4, byteorder="little", signed=False) + packed
-    return zlib.compress(raw_payload, level=9)
-
-
-def _decode_token_backup_payload(payload: bytes) -> List[int]:
-    raw = zlib.decompress(payload)
-    if len(raw) < 4:
-        raise RuntimeError("Invalid correction payload: too short")
-
-    count = int.from_bytes(raw[:4], byteorder="little", signed=False)
-    arr = array.array("I")
-    arr.frombytes(raw[4:])
-    if count > len(arr):
-        raise RuntimeError("Invalid correction payload: token count exceeds payload length")
-    return [int(x) for x in arr[:count]]
 
 
 def _load_codec(settings: Dict[str, Any]) -> APILLMCodec:
@@ -183,10 +156,6 @@ def _phase_encode(config: Dict[str, Any], file_path: Path, artifact_dir: Path):
     safe_mode = bool(settings.get("safe_mode", True))
     text_encoding = _encoding_for_file(settings, file_path)
     diagnostics_enabled = bool(settings.get("diagnostics_enabled", False))
-    correction_mode = str(settings.get("correction_mode", CORRECTION_MODE_NONE)).strip().lower()
-    if correction_mode not in {CORRECTION_MODE_NONE, CORRECTION_MODE_TOKEN_BACKUP}:
-        raise ValueError("Unsupported correction_mode. Expected one of: off, token_backup")
-
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
     text = _read_text(file_path, text_encoding)
@@ -211,23 +180,14 @@ def _phase_encode(config: Dict[str, Any], file_path: Path, artifact_dir: Path):
         encoded_bytes = encoded_result
         num_tokens = None
 
-    correction_bytes = b""
-    if correction_mode == CORRECTION_MODE_TOKEN_BACKUP:
-        correction_bytes = _build_token_backup_payload(codec, text, safe_mode=safe_mode)
-        (artifact_dir / "correction.bin").write_bytes(correction_bytes)
-
     original_size_bytes = len(text.encode(text_encoding, errors="replace"))
     (artifact_dir / "encoded.bin").write_bytes(encoded_bytes)
-    total_encoded_size_bytes = len(encoded_bytes) + len(correction_bytes)
     metadata = {
         "input_file": str(file_path),
         "safe_mode": safe_mode,
         "num_tokens": num_tokens,
         "encode_seconds": encode_seconds,
         "encoded_size_bytes": len(encoded_bytes),
-        "correction_mode": correction_mode,
-        "correction_size_bytes": len(correction_bytes),
-        "encoded_size_total_bytes": total_encoded_size_bytes,
         "original_size_bytes": original_size_bytes,
         "text_encoding": text_encoding,
         "effective_settings": {
@@ -251,7 +211,6 @@ def _phase_encode(config: Dict[str, Any], file_path: Path, artifact_dir: Path):
             "strict_single_id_mapping": bool(local_settings.get("strict_single_id_mapping", True)),
             "tokenizer_backend": str(local_settings.get("tokenizer_backend", "qwen_tokenizer")),
             "tokenizer_name": str(local_settings.get("tokenizer_name", "qwen-max")),
-            "correction_mode": correction_mode,
         },
     }
     (artifact_dir / "encode_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
@@ -279,26 +238,18 @@ def _phase_decode(config: Dict[str, Any], artifact_dir: Path):
     text_encoding = encode_meta.get("text_encoding", settings.get("text_encoding", "utf-8"))
     codec = _load_codec(settings)
 
-    correction_mode = str(settings.get("correction_mode", encode_meta.get("correction_mode", CORRECTION_MODE_NONE))).strip().lower()
-
     start = time.time()
-    if correction_mode == CORRECTION_MODE_TOKEN_BACKUP and (artifact_dir / "correction.bin").exists():
-        token_ids = _decode_token_backup_payload((artifact_dir / "correction.bin").read_bytes())
-        if not safe_mode and token_ids and int(token_ids[-1]) == int(codec.eof_token_id):
-            token_ids = token_ids[:-1]
-        decoded_text = codec._decode_ids(token_ids, skip_special_tokens=True)
-    else:
-        encoded_bytes = encoded_path.read_bytes()
+    encoded_bytes = encoded_path.read_bytes()
 
-        decode_kwargs: Dict[str, Any] = {
-            "max_decode_tokens": settings.get("max_decode_tokens"),
-            "safe_mode": safe_mode,
-            "show_progress": False,
-        }
-        if safe_mode:
-            decode_kwargs["expected_num_tokens"] = int(encode_meta["num_tokens"])
+    decode_kwargs: Dict[str, Any] = {
+        "max_decode_tokens": settings.get("max_decode_tokens"),
+        "safe_mode": safe_mode,
+        "show_progress": False,
+    }
+    if safe_mode:
+        decode_kwargs["expected_num_tokens"] = int(encode_meta["num_tokens"])
 
-        decoded_text = codec.decode(encoded_bytes, **decode_kwargs)
+    decoded_text = codec.decode(encoded_bytes, **decode_kwargs)
     decode_seconds = time.time() - start
 
     (artifact_dir / "decoded.txt").write_text(decoded_text, encoding=text_encoding, errors="replace")
@@ -444,17 +395,9 @@ def _run_orchestrator(config_path: Path):
             "safe_mode": encode_meta.get("safe_mode", True),
             "num_tokens": encode_meta.get("num_tokens"),
             "encoded_size_bytes": encode_meta.get("encoded_size_bytes", 0),
-            "correction_size_bytes": encode_meta.get("correction_size_bytes", 0),
-            "encoded_size_total_bytes": encode_meta.get(
-                "encoded_size_total_bytes",
-                encode_meta.get("encoded_size_bytes", 0) + encode_meta.get("correction_size_bytes", 0),
-            ),
             "compression_ratio": (
                 (
-                    encode_meta.get(
-                        "encoded_size_total_bytes",
-                        encode_meta.get("encoded_size_bytes", 0) + encode_meta.get("correction_size_bytes", 0),
-                    )
+                    encode_meta.get("encoded_size_bytes", 0)
                     * 8
                 )
                 / encode_meta.get("original_size_bytes", 1)
