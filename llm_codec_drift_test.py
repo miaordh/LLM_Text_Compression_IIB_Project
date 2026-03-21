@@ -34,6 +34,14 @@ class DriftTestCodecConfig:
 
     diagnostics_csv_prefix: Optional[str] = None
     determinism_mode: Optional[str] = None
+    inference_backend: str = "auto"
+    model_id: Optional[str] = None
+    trust_remote_code: bool = False
+    revision: Optional[str] = None
+    torch_dtype: str = "auto"
+    vllm_tensor_parallel_size: int = 1
+    vllm_gpu_memory_utilization: float = 0.9
+    vllm_max_logprobs: Optional[int] = None
 
     # Drift-test specific knobs
     drift_correction_enabled: bool = True
@@ -54,7 +62,7 @@ class DriftAwareLLMCodec:
     def __init__(
         self,
         tokenizer,
-        model,
+        model=None,
         device: str = "auto",
         config: Optional[DriftTestCodecConfig] = None,
     ):
@@ -75,6 +83,14 @@ class DriftAwareLLMCodec:
                 prob_round_decimals=self.config.prob_round_decimals,
                 diagnostics_csv_prefix=self.config.diagnostics_csv_prefix,
                 determinism_mode=self.config.determinism_mode,
+                inference_backend=getattr(self.config, "inference_backend", "auto"),
+                model_id=getattr(self.config, "model_id", None),
+                trust_remote_code=bool(getattr(self.config, "trust_remote_code", False)),
+                revision=getattr(self.config, "revision", None),
+                torch_dtype=str(getattr(self.config, "torch_dtype", "auto")),
+                vllm_tensor_parallel_size=int(getattr(self.config, "vllm_tensor_parallel_size", 1)),
+                vllm_gpu_memory_utilization=float(getattr(self.config, "vllm_gpu_memory_utilization", 0.9)),
+                vllm_max_logprobs=getattr(self.config, "vllm_max_logprobs", None),
             ),
         )
         self.device = self.base.device

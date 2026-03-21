@@ -111,6 +111,130 @@ def _apply_tbik_patches():
         ) from exc
 
 
+def _triton_is_available() -> bool:
+    return importlib.util.find_spec("triton") is not None
+
+
+class _VLLMLogitsBackend:
+    def __init__(
+        self,
+        model_id: str,
+        tokenizer,
+        device: torch.device,
+        trust_remote_code: bool = False,
+        revision: Optional[str] = None,
+        torch_dtype: str = "auto",
+        tensor_parallel_size: int = 1,
+        gpu_memory_utilization: float = 0.9,
+        max_logprobs: Optional[int] = None,
+    ):
+        try:
+            from vllm import LLM, SamplingParams
+        except Exception as exc:
+            raise RuntimeError(
+                "vLLM backend requested, but vllm is not importable. Install vllm on CUDA Linux."
+            ) from exc
+
+        if device.type != "cuda":
+            raise RuntimeError("vLLM backend currently requires CUDA device")
+
+        self._tokenizer = tokenizer
+        self._device = device
+        self._vocab_size = int(len(tokenizer))
+        self._bos_token_id = getattr(tokenizer, "bos_token_id", None)
+        self._pad_token_id = getattr(tokenizer, "pad_token_id", None)
+        self._max_logprobs = int(max_logprobs) if max_logprobs is not None else int(self._vocab_size)
+        if self._max_logprobs <= 0:
+            self._max_logprobs = int(self._vocab_size)
+
+        engine_kwargs: Dict[str, Any] = {
+            "model": model_id,
+            "trust_remote_code": bool(trust_remote_code),
+            "tensor_parallel_size": max(1, int(tensor_parallel_size)),
+            "gpu_memory_utilization": float(gpu_memory_utilization),
+            "enforce_eager": True,
+            "enable_prefix_caching": False,
+            "max_logprobs": self._max_logprobs,
+            "logprobs_mode": "raw_logprobs",
+        }
+        if revision:
+            engine_kwargs["revision"] = revision
+
+        if torch_dtype in {"float16", "bfloat16", "float32"}:
+            engine_kwargs["dtype"] = torch_dtype
+
+        self._llm = LLM(**engine_kwargs)
+        self._sampling_params = SamplingParams(
+            temperature=0.0,
+            top_p=1.0,
+            max_tokens=1,
+            seed=1,
+            logprobs=self._max_logprobs,
+            detokenize=False,
+            ignore_eos=True,
+        )
+
+    def _prompt_ids(self, prefix_ids: Sequence[int]) -> List[int]:
+        if prefix_ids:
+            return [int(t) for t in prefix_ids]
+        bos = self._bos_token_id
+        if bos is None:
+            bos = self._pad_token_id
+        if bos is None:
+            bos = 0
+        return [int(bos)]
+
+    def _logprob_value(self, value: Any) -> float:
+        if hasattr(value, "logprob"):
+            return float(value.logprob)
+        return float(value)
+
+    def next_logits(self, prefix_ids: Sequence[int]) -> torch.Tensor:
+        prompt_ids = self._prompt_ids(prefix_ids)
+        outputs = self._llm.generate(
+            prompt_token_ids=[prompt_ids],
+            sampling_params=self._sampling_params,
+            use_tqdm=False,
+        )
+        if not outputs or not outputs[0].outputs:
+            raise RuntimeError("vLLM returned empty outputs while requesting next-token logits")
+
+        token_logprobs = outputs[0].outputs[0].logprobs
+        if not token_logprobs:
+            raise RuntimeError("vLLM did not return token logprobs for the next token")
+
+        step_dict = token_logprobs[0]
+        probs = np.zeros((self._vocab_size,), dtype=np.float64)
+        assigned = np.zeros((self._vocab_size,), dtype=np.bool_)
+
+        for token_id, payload in step_dict.items():
+            idx = int(token_id)
+            if 0 <= idx < self._vocab_size:
+                lp = self._logprob_value(payload)
+                p = float(np.exp(lp))
+                if p > 0.0:
+                    probs[idx] = p
+                    assigned[idx] = True
+
+        known_mass = float(probs.sum())
+        unknown = int((~assigned).sum())
+        residual = max(0.0, 1.0 - known_mass)
+        if unknown > 0:
+            fill = residual / float(unknown)
+            if fill <= 0.0:
+                fill = 1e-12
+            probs[~assigned] = fill
+
+        total = float(probs.sum())
+        if not np.isfinite(total) or total <= 0.0:
+            probs[:] = 1.0 / float(self._vocab_size)
+        else:
+            probs /= total
+
+        logits = np.log(np.clip(probs, 1e-45, 1.0)).astype(np.float32, copy=False)
+        return torch.from_numpy(logits).to(device=self._device)
+
+
 def _cpu_batch_invariant_log_softmax(input_tensor: torch.Tensor, dim: int = -1) -> torch.Tensor:
     # Fixed-order two-pass reduction on CPU to reduce sensitivity to reduction-order changes.
     if dim < 0:
@@ -167,13 +291,21 @@ class DeterministicCodecConfig:
     diagnostics_csv_prefix: Optional[str] = None
 
     determinism_mode: Optional[str] = None
+    inference_backend: str = "auto"  # auto | huggingface | vllm
+    model_id: Optional[str] = None
+    trust_remote_code: bool = False
+    revision: Optional[str] = None
+    torch_dtype: str = "auto"
+    vllm_tensor_parallel_size: int = 1
+    vllm_gpu_memory_utilization: float = 0.9
+    vllm_max_logprobs: Optional[int] = None
 
 
 class DeterministicLLMCodec:
     def __init__(
         self,
         tokenizer,
-        model,
+        model=None,
         device: str = "auto",
         config: Optional[DeterministicCodecConfig] = None,
     ):
@@ -190,8 +322,16 @@ class DeterministicLLMCodec:
         else:
             self.device = torch.device(device)
 
-        self.model = model.to(self.device)
-        self.model.eval()
+        self._determinism_mode = _normalize_determinism_mode(self.config.determinism_mode)
+        self._inference_backend = self._resolve_inference_backend()
+
+        self.model = None
+        self._vllm_backend = None
+        if self._inference_backend == "huggingface":
+            if model is None:
+                raise ValueError("Hugging Face backend requires a loaded model instance")
+            self.model = model.to(self.device)
+            self.model.eval()
 
         if self.config.strategy not in {"rolling", "block", "no_kv_cache"}:
             raise ValueError(
@@ -206,27 +346,81 @@ class DeterministicLLMCodec:
 
         self.block_stride = max(1, self.config.context_window - self.config.margin)
 
-        if "<EOF>" not in self.tokenizer.all_special_tokens:
-            self.tokenizer.add_special_tokens({"additional_special_tokens": ["<EOF>"]})
-            self.model.resize_token_embeddings(len(self.tokenizer))
-        self.eof_token_id = self.tokenizer.convert_tokens_to_ids("<EOF>")
+        if self._inference_backend == "huggingface":
+            if "<EOF>" not in self.tokenizer.all_special_tokens:
+                self.tokenizer.add_special_tokens({"additional_special_tokens": ["<EOF>"]})
+                self.model.resize_token_embeddings(len(self.tokenizer))
+            self.eof_token_id = self.tokenizer.convert_tokens_to_ids("<EOF>")
+        else:
+            self.eof_token_id = self._resolve_existing_eof_token_id()
 
         self.dec_prec = max(50, int(math.ceil(self.config.precision * math.log10(2))) + 10)
 
         self._batch_invariant_enabled = False
         self._log_softmax_fn = torch.log_softmax
         self._batch_invariant_ctx = nullcontext
-        self._determinism_mode = _normalize_determinism_mode(self.config.determinism_mode)
 
-        try:
-            self.model.config._attn_implementation = "eager"
-        except Exception:
-            pass
+        if self.model is not None:
+            try:
+                self.model.config._attn_implementation = "eager"
+            except Exception:
+                pass
 
         self._configure_determinism_runtime()
+        if self._inference_backend == "vllm":
+            model_id = self.config.model_id
+            if not model_id:
+                raise ValueError("vLLM backend requires config.model_id")
+            self._vllm_backend = _VLLMLogitsBackend(
+                model_id=str(model_id),
+                tokenizer=self.tokenizer,
+                device=self.device,
+                trust_remote_code=bool(self.config.trust_remote_code),
+                revision=self.config.revision,
+                torch_dtype=str(self.config.torch_dtype),
+                tensor_parallel_size=int(self.config.vllm_tensor_parallel_size),
+                gpu_memory_utilization=float(self.config.vllm_gpu_memory_utilization),
+                max_logprobs=self.config.vllm_max_logprobs,
+            )
+
+    def _resolve_inference_backend(self) -> str:
+        backend = str(self.config.inference_backend or "auto").strip().lower()
+        if backend in {"hf", "transformers", "huggingface"}:
+            return "huggingface"
+        if backend in {"vllm"}:
+            return "vllm"
+        if backend not in {"", "auto"}:
+            raise ValueError("Unsupported inference_backend. Expected one of: auto, huggingface, vllm")
+
+        if self._determinism_mode is None:
+            return "huggingface"
+        if self.device.type != "cuda":
+            return "huggingface"
+        if not _triton_is_available():
+            return "huggingface"
+        return "vllm"
+
+    def _resolve_existing_eof_token_id(self) -> int:
+        for token_attr in ("eos_token_id", "eod_id", "im_end_id"):
+            token_id = getattr(self.tokenizer, token_attr, None)
+            if isinstance(token_id, int) and token_id >= 0:
+                return int(token_id)
+
+        token_id = self.tokenizer.convert_tokens_to_ids("<EOF>")
+        if isinstance(token_id, int) and token_id >= 0:
+            return int(token_id)
+
+        pad_id = getattr(self.tokenizer, "pad_token_id", None)
+        if isinstance(pad_id, int) and pad_id >= 0:
+            return int(pad_id)
+        return 0
 
     def _diagnostics_enabled(self) -> bool:
         return bool(self.config.diagnostics_csv_prefix)
+
+    @property
+    def inference_backend(self) -> str:
+        return self._inference_backend
 
     def _diagnostics_csv_path(self, phase: str) -> Path:
         base = Path(str(self.config.diagnostics_csv_prefix))
@@ -562,6 +756,9 @@ class DeterministicLLMCodec:
         return position_ids
 
     def _logits_for_prefix(self, prefix_ids):
+        if self._vllm_backend is not None:
+            return self._vllm_backend.next_logits(prefix_ids)
+
         if len(prefix_ids) == 0:
             bos = self.tokenizer.bos_token_id
             if bos is None:
@@ -602,6 +799,9 @@ class DeterministicLLMCodec:
         return past_kv
 
     def _hard_reset_cache_and_warmup(self, full_sequence, current_index, warmup_length):
+        if self._vllm_backend is not None:
+            return self._init_cache_state()
+
         gc.collect()
         if self.device.type == "mps":
             torch.mps.empty_cache()
@@ -673,6 +873,9 @@ class DeterministicLLMCodec:
         return cache_state
 
     def _get_logits(self, current_idx, full_token_sequence, cache_state):
+        if self._vllm_backend is not None:
+            return self._vllm_backend.next_logits(full_token_sequence[:current_idx])
+
         if not self.use_kv_cache:
             start = max(0, current_idx - self.config.context_window)
             context = full_token_sequence[start:current_idx]
@@ -705,6 +908,9 @@ class DeterministicLLMCodec:
         return torch.log(torch.ones(self.tokenizer.vocab_size).to(self.device))
 
     def _advance_state(self, just_encoded_token_id, cache_state):
+        if self._vllm_backend is not None:
+            return cache_state
+
         if not self.use_kv_cache:
             return cache_state
 

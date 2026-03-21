@@ -1,5 +1,6 @@
 import argparse
 import gc
+import importlib.util
 import json
 import math
 import os
@@ -110,6 +111,22 @@ def _resolve_torch_dtype(dtype_name: str, device: str):
     return mapping[dtype_name]
 
 
+def _triton_available() -> bool:
+    return importlib.util.find_spec("triton") is not None
+
+
+def _should_use_vllm(settings: Dict[str, Any], device: str, determinism_mode: Optional[str]) -> bool:
+    backend = str(settings.get("inference_backend", "auto")).strip().lower()
+    if backend in {"huggingface", "hf", "transformers"}:
+        return False
+    if backend == "vllm":
+        return True
+    if backend not in {"", "auto"}:
+        raise ValueError("Unsupported inference_backend. Expected one of: auto, huggingface, vllm")
+
+    return bool(determinism_mode in {"batch_invariant_ops", "tbik"} and device == "cuda" and _triton_available())
+
+
 def _load_model_tokenizer(settings: Dict[str, Any], device: str):
     model_kwargs: Dict[str, Any] = {
         "trust_remote_code": bool(settings.get("trust_remote_code", False)),
@@ -119,7 +136,8 @@ def _load_model_tokenizer(settings: Dict[str, Any], device: str):
     if revision:
         model_kwargs["revision"] = revision
 
-    dtype = _resolve_torch_dtype(str(settings.get("torch_dtype", "auto")), device)
+    dtype_name = str(settings.get("torch_dtype", "auto"))
+    dtype = _resolve_torch_dtype(dtype_name, device)
     if dtype != "auto":
         model_kwargs["dtype"] = dtype
 
@@ -131,20 +149,33 @@ def _load_model_tokenizer(settings: Dict[str, Any], device: str):
     if bool(settings.get("ignore_model_max_length_warning", True)):
         tokenizer.model_max_length = int(1e30)
 
-    try:
-        model = AutoModelForCausalLM.from_pretrained(settings["model_id"], **model_kwargs)
-    except TypeError:
-        if "dtype" not in model_kwargs:
-            raise
-        fallback_kwargs = dict(model_kwargs)
-        fallback_kwargs["torch_dtype"] = fallback_kwargs.pop("dtype")
-        model = AutoModelForCausalLM.from_pretrained(settings["model_id"], **fallback_kwargs)
+    determinism_mode = trial_mode = None
+    model = None
+    # Mode is trial-dependent; this helper is called with per-trial merged settings.
+    trial_mode = settings.get("determinism_mode")
+    if trial_mode is not None:
+        determinism_mode = str(trial_mode).strip().lower()
+        if determinism_mode in {"", "none", "off", "false", "0"}:
+            determinism_mode = None
 
-    return tokenizer, model
+    use_vllm = _should_use_vllm(settings, device, determinism_mode)
+    if not use_vllm:
+        try:
+            model = AutoModelForCausalLM.from_pretrained(settings["model_id"], **model_kwargs)
+        except TypeError:
+            if "dtype" not in model_kwargs:
+                raise
+            fallback_kwargs = dict(model_kwargs)
+            fallback_kwargs["torch_dtype"] = fallback_kwargs.pop("dtype")
+            model = AutoModelForCausalLM.from_pretrained(settings["model_id"], **fallback_kwargs)
+
+    return tokenizer, model, use_vllm
 
 
 def _build_codec_config(
     trial: Dict[str, Any],
+    runtime_settings: Dict[str, Any],
+    use_vllm: bool,
     diagnostics_prefix: Optional[str],
     trace_prefix: Optional[str],
     drift_prefix: Optional[str],
@@ -161,6 +192,14 @@ def _build_codec_config(
         prob_round_decimals=int(trial.get("prob_round_decimals", 5)),
         diagnostics_csv_prefix=diagnostics_prefix,
         determinism_mode=trial.get("determinism_mode"),
+        inference_backend="vllm" if use_vllm else "huggingface",
+        model_id=str(runtime_settings.get("model_id")),
+        trust_remote_code=bool(runtime_settings.get("trust_remote_code", False)),
+        revision=runtime_settings.get("revision"),
+        torch_dtype=str(runtime_settings.get("torch_dtype", "auto")),
+        vllm_tensor_parallel_size=int(runtime_settings.get("vllm_tensor_parallel_size", 1)),
+        vllm_gpu_memory_utilization=float(runtime_settings.get("vllm_gpu_memory_utilization", 0.9)),
+        vllm_max_logprobs=runtime_settings.get("vllm_max_logprobs"),
         drift_correction_enabled=bool(trial.get("drift_correction_enabled", True)),
         drift_measurements_csv_prefix=drift_prefix,
         encoder_trace_csv_prefix=trace_prefix,
@@ -200,14 +239,25 @@ def _run_trial_on_file(
     start_total = time.time()
     encode_codec = None
     decode_codec = None
+    enc_use_vllm = False
+    dec_use_vllm = False
+    trial_runtime_settings = dict(global_settings)
+    trial_runtime_settings["determinism_mode"] = trial.get("determinism_mode")
 
     try:
-        enc_tokenizer, enc_model = _load_model_tokenizer(global_settings, encode_device)
+        enc_tokenizer, enc_model, enc_use_vllm = _load_model_tokenizer(trial_runtime_settings, encode_device)
         encode_codec = DriftAwareLLMCodec(
             tokenizer=enc_tokenizer,
             model=enc_model,
             device=encode_device,
-            config=_build_codec_config(trial, diagnostics_prefix, trace_prefix, drift_prefix),
+            config=_build_codec_config(
+                trial,
+                trial_runtime_settings,
+                enc_use_vllm,
+                diagnostics_prefix,
+                trace_prefix,
+                drift_prefix,
+            ),
         )
 
         t0 = time.time()
@@ -219,12 +269,19 @@ def _run_trial_on_file(
         )
         encode_seconds = time.time() - t0
 
-        dec_tokenizer, dec_model = _load_model_tokenizer(global_settings, decode_device)
+        dec_tokenizer, dec_model, dec_use_vllm = _load_model_tokenizer(trial_runtime_settings, decode_device)
         decode_codec = DriftAwareLLMCodec(
             tokenizer=dec_tokenizer,
             model=dec_model,
             device=decode_device,
-            config=_build_codec_config(trial, diagnostics_prefix, trace_prefix, drift_prefix),
+            config=_build_codec_config(
+                trial,
+                trial_runtime_settings,
+                dec_use_vllm,
+                diagnostics_prefix,
+                trace_prefix,
+                drift_prefix,
+            ),
         )
 
         t1 = time.time()
@@ -257,6 +314,8 @@ def _run_trial_on_file(
             "device_mode": device_mode,
             "encode_device": encode_device,
             "decode_device": decode_device,
+            "encode_backend": "vllm" if enc_use_vllm else "huggingface",
+            "decode_backend": "vllm" if dec_use_vllm else "huggingface",
             "determinism_mode": str(trial.get("determinism_mode")),
             "quant": bool(trial.get("quant", False)),
             "slots": int(trial.get("slots", 1 << 24)),
@@ -291,6 +350,8 @@ def _run_trial_on_file(
             "device_mode": device_mode,
             "encode_device": encode_device,
             "decode_device": decode_device,
+            "encode_backend": "vllm" if enc_use_vllm else "huggingface",
+            "decode_backend": "vllm" if dec_use_vllm else "huggingface",
             "determinism_mode": str(trial.get("determinism_mode")),
             "quant": bool(trial.get("quant", False)),
             "slots": int(trial.get("slots", 1 << 24)),

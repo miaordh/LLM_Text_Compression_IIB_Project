@@ -1,4 +1,5 @@
 import argparse
+import importlib.util
 import os
 import gc
 import hashlib
@@ -7,7 +8,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import torch
@@ -102,6 +103,22 @@ def _resolve_torch_dtype(dtype_name: str, device: str):
     return mapping[dtype_name]
 
 
+def _triton_available() -> bool:
+    return importlib.util.find_spec("triton") is not None
+
+
+def _should_use_vllm(settings: Dict[str, Any], device: str, determinism_mode: Optional[str]) -> bool:
+    backend = str(settings.get("inference_backend", "auto")).strip().lower()
+    if backend in {"huggingface", "hf", "transformers"}:
+        return False
+    if backend == "vllm":
+        return True
+    if backend not in {"", "auto"}:
+        raise ValueError("Unsupported inference_backend. Expected one of: auto, huggingface, vllm")
+
+    return bool(determinism_mode in {"batch_invariant_ops", "tbik"} and device == "cuda" and _triton_available())
+
+
 def _is_cuda_oom(exc: BaseException) -> bool:
     text = str(exc).lower()
     return "out of memory" in text and ("cuda" in text or "cudnn" in text)
@@ -175,6 +192,8 @@ def _sanitize_error_text(stderr_text: str) -> str:
 
 def _load_codec(settings: Dict[str, Any]) -> DeterministicLLMCodec:
     device = _resolve_device(settings.get("device", "auto"))
+    determinism_mode = _resolve_determinism_mode(settings)
+    use_vllm = _should_use_vllm(settings, device, determinism_mode)
 
     if device == "cuda":
         # Helps with long-running fragmentation-heavy workloads.
@@ -185,7 +204,8 @@ def _load_codec(settings: Dict[str, Any]) -> DeterministicLLMCodec:
         "low_cpu_mem_usage": True,
     }
 
-    torch_dtype = _resolve_torch_dtype(settings.get("torch_dtype", "auto"), device)
+    torch_dtype_name = str(settings.get("torch_dtype", "auto"))
+    torch_dtype = _resolve_torch_dtype(torch_dtype_name, device)
     if torch_dtype != "auto":
         # Newer Transformers prefers `dtype`; older versions still accept `torch_dtype`.
         model_kwargs["dtype"] = torch_dtype
@@ -211,16 +231,16 @@ def _load_codec(settings: Dict[str, Any]) -> DeterministicLLMCodec:
             "Use slots >= vocab size (for example 1<<18 or 1<<20 for ~150k vocab)."
         )
 
-    try:
-        model = AutoModelForCausalLM.from_pretrained(settings["model_id"], **model_kwargs)
-    except TypeError:
-        if "dtype" not in model_kwargs:
-            raise
-        fallback_kwargs = dict(model_kwargs)
-        fallback_kwargs["torch_dtype"] = fallback_kwargs.pop("dtype")
-        model = AutoModelForCausalLM.from_pretrained(settings["model_id"], **fallback_kwargs)
-
-    determinism_mode = _resolve_determinism_mode(settings)
+    model = None
+    if not use_vllm:
+        try:
+            model = AutoModelForCausalLM.from_pretrained(settings["model_id"], **model_kwargs)
+        except TypeError:
+            if "dtype" not in model_kwargs:
+                raise
+            fallback_kwargs = dict(model_kwargs)
+            fallback_kwargs["torch_dtype"] = fallback_kwargs.pop("dtype")
+            model = AutoModelForCausalLM.from_pretrained(settings["model_id"], **fallback_kwargs)
 
     config = DeterministicCodecConfig(
         precision=int(settings.get("precision", 32)),
@@ -234,6 +254,14 @@ def _load_codec(settings: Dict[str, Any]) -> DeterministicLLMCodec:
         prob_round_decimals=int(settings.get("prob_round_decimals", 5)),
         diagnostics_csv_prefix=settings.get("diagnostics_csv_prefix"),
         determinism_mode=determinism_mode,
+        inference_backend="vllm" if use_vllm else "huggingface",
+        model_id=str(settings.get("model_id")),
+        trust_remote_code=bool(settings.get("trust_remote_code", False)),
+        revision=revision,
+        torch_dtype=torch_dtype_name,
+        vllm_tensor_parallel_size=int(settings.get("vllm_tensor_parallel_size", 1)),
+        vllm_gpu_memory_utilization=float(settings.get("vllm_gpu_memory_utilization", 0.9)),
+        vllm_max_logprobs=settings.get("vllm_max_logprobs"),
     )
 
     return DeterministicLLMCodec(tokenizer=tokenizer, model=model, device=device, config=config)
@@ -313,6 +341,12 @@ def _phase_encode(config: Dict[str, Any], file_path: Path, artifact_dir: Path):
                 "effective_settings": {
                     "device": attempt_settings.get("device", "auto"),
                     "torch_dtype": attempt_settings.get("torch_dtype", "auto"),
+                    "inference_backend": attempt_settings.get("inference_backend", "auto"),
+                    "vllm_tensor_parallel_size": int(attempt_settings.get("vllm_tensor_parallel_size", 1)),
+                    "vllm_gpu_memory_utilization": float(
+                        attempt_settings.get("vllm_gpu_memory_utilization", 0.9)
+                    ),
+                    "vllm_max_logprobs": attempt_settings.get("vllm_max_logprobs"),
                     "context_window": int(attempt_settings.get("context_window", 2048)),
                     "margin": int(attempt_settings.get("margin", 128)),
                     "strategy": str(attempt_settings.get("strategy", "rolling")),
@@ -598,6 +632,9 @@ def _run_orchestrator(config_path: Path):
             row = {
                 "file": str(file_path),
                 "status": "ok" if is_match else "mismatch",
+                "inference_backend": str(
+                    (encode_meta.get("effective_settings") or {}).get("inference_backend", "auto")
+                ),
                 "input_size_bytes": encode_meta.get("original_size_bytes", 0),
                 "safe_mode": encode_meta["safe_mode"],
                 "num_tokens": encode_meta["num_tokens"],

@@ -11,7 +11,7 @@ from typing import List
 # ---------------------------
 # Runner settings (edit me)
 # ---------------------------
-MODEL_ID = "Qwen/Qwen2.5-0.5B"
+MODEL_ID = "openai-community/gpt2"
 REVISION = None
 TRUST_REMOTE_CODE = False
 TORCH_DTYPE = "float32"  # auto | float32 | float16 | bfloat16
@@ -25,14 +25,14 @@ DEVICE_MODE = "single_device"  # single_device | cross_device
 IGNORE_MODEL_MAX_LENGTH_WARNING = True
 ENABLE_OOM_FALLBACK = True
 OOM_FALLBACK_STRATEGY = "block"  # rolling | block | no_kv_cache
-OOM_FALLBACK_CONTEXT_WINDOW = 128
-OOM_FALLBACK_MARGIN = 16
+OOM_FALLBACK_CONTEXT_WINDOW = 16
+OOM_FALLBACK_MARGIN = 2
 
 SAFE_MODE = True
 PRECISION = 32
 SLOTS = 1 << 24
-CONTEXT_WINDOW = 1024
-MARGIN = 128
+CONTEXT_WINDOW = 128
+MARGIN = 16
 STRATEGY = "rolling"  # rolling | block | no_kv_cache
 USE_LEGACY_COUNTS = False
 QUANT = False
@@ -41,6 +41,11 @@ PROB_ROUND_DECIMALS = 1
 # None | batch_invariant_ops | tbik
 # In cross_device mode, worker encodes on CPU and decodes on accelerator.
 DETERMINISM_MODE = "tbik"
+INFERENCE_BACKEND = "auto"  # auto | huggingface | vllm
+VLLM_TENSOR_PARALLEL_SIZE = 1
+VLLM_GPU_MEMORY_UTILIZATION = 0.9
+# None -> use tokenizer vocab size as max_logprobs for full-distribution reconstruction.
+VLLM_MAX_LOGPROBS = None
 MAX_DECODE_TOKENS = None
 DIAGNOSTICS_ENABLED = True
 # Optional diagnostics CSV prefix. If None and diagnostics is enabled, worker writes
@@ -85,17 +90,14 @@ CANTRBRY_FILE_SELECTION = None
 # - "all": run every .txt file directly under project root
 # - list[str]: explicit relative filenames (for example under my_corpus/)
 # CURRENT_FOLDER_TEXT_SELECTION = ["my_corpus/Shall I Compare Thee To a Summer's Day.txt", "my_corpus/再别康桥.txt"]
-CURRENT_FOLDER_TEXT_SELECTION = [
-    "my_corpus/Shall I Compare Thee To a Summer's Day.txt",
-    "my_corpus/再别康桥.txt",
-]
+CURRENT_FOLDER_TEXT_SELECTION = None
 # CURRENT_FOLDER_TEXT_SELECTION = None
 
 # File selection for my_corpus:
 # - None: run nothing from MY_CORPUS_DIR
 # - "all": run every .txt file under MY_CORPUS_DIR
 # - list[str]: explicit filenames relative to MY_CORPUS_DIR
-MY_CORPUS_FILE_SELECTION = None
+MY_CORPUS_FILE_SELECTION = ["Shall I Compare Thee To a Summer's Day.txt", "再别康桥.txt"]
 
 # File selection for artificial_corpus:
 # - None: run nothing from ARTIFICIAL_CORPUS_DIR
@@ -213,6 +215,10 @@ def main():
         "logit_round_decimals": LOGIT_ROUND_DECIMALS,
         "prob_round_decimals": PROB_ROUND_DECIMALS,
         "determinism_mode": DETERMINISM_MODE,
+        "inference_backend": INFERENCE_BACKEND,
+        "vllm_tensor_parallel_size": VLLM_TENSOR_PARALLEL_SIZE,
+        "vllm_gpu_memory_utilization": VLLM_GPU_MEMORY_UTILIZATION,
+        "vllm_max_logprobs": VLLM_MAX_LOGPROBS,
         "max_decode_tokens": MAX_DECODE_TOKENS,
         "diagnostics_enabled": DIAGNOSTICS_ENABLED,
         "diagnostics_csv_prefix": DIAGNOSTICS_CSV_PREFIX,

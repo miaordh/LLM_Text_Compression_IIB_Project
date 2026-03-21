@@ -18,6 +18,10 @@ TRUST_REMOTE_CODE = False
 TORCH_DTYPE = "float16"  # auto | float32 | float16 | bfloat16
 DEVICE = "mps"  # auto | cpu | cuda | mps
 DEVICE_MODE = "cross_device"  # single_device | cross_device
+INFERENCE_BACKEND = "auto"  # auto | huggingface | vllm
+VLLM_TENSOR_PARALLEL_SIZE = 1
+VLLM_GPU_MEMORY_UTILIZATION = 0.9
+VLLM_MAX_LOGPROBS = None
 
 SAFE_MODE = True
 MAX_DECODE_TOKENS = None
@@ -195,6 +199,10 @@ def main():
             "torch_dtype": TORCH_DTYPE,
             "device": DEVICE,
             "device_mode": DEVICE_MODE,
+            "inference_backend": INFERENCE_BACKEND,
+            "vllm_tensor_parallel_size": VLLM_TENSOR_PARALLEL_SIZE,
+            "vllm_gpu_memory_utilization": VLLM_GPU_MEMORY_UTILIZATION,
+            "vllm_max_logprobs": VLLM_MAX_LOGPROBS,
             "safe_mode": SAFE_MODE,
             "max_decode_tokens": MAX_DECODE_TOKENS,
             "show_progress": SHOW_PROGRESS,
