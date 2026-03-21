@@ -226,9 +226,22 @@ def _run_trial_on_file(
     device_mode = str(global_settings.get("device_mode", "single_device")).strip().lower()
     base_device = _resolve_device(str(global_settings.get("device", "auto")))
 
+    trial_runtime_settings = dict(global_settings)
+    trial_runtime_settings["determinism_mode"] = trial.get("determinism_mode")
+    trial_determinism_mode = trial_runtime_settings["determinism_mode"]
+    if trial_determinism_mode is not None:
+        trial_determinism_mode = str(trial_determinism_mode).strip().lower()
+        if trial_determinism_mode in {"", "none", "off", "false", "0"}:
+            trial_determinism_mode = None
+
     if device_mode == "cross_device":
-        encode_device = "cpu"
-        decode_device = _preferred_accelerator_device()
+        accel_device = _preferred_accelerator_device()
+        if _should_use_vllm(trial_runtime_settings, accel_device, trial_determinism_mode):
+            encode_device = accel_device
+            decode_device = accel_device
+        else:
+            encode_device = "cpu"
+            decode_device = accel_device
     else:
         encode_device = base_device
         decode_device = base_device
@@ -242,8 +255,6 @@ def _run_trial_on_file(
     decode_codec = None
     enc_use_vllm = False
     dec_use_vllm = False
-    trial_runtime_settings = dict(global_settings)
-    trial_runtime_settings["determinism_mode"] = trial.get("determinism_mode")
 
     try:
         enc_tokenizer, enc_model, enc_use_vllm = _load_model_tokenizer(trial_runtime_settings, encode_device)

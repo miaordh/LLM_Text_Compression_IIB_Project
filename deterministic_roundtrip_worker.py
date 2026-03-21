@@ -284,11 +284,17 @@ def _phase_encode(config: Dict[str, Any], file_path: Path, artifact_dir: Path):
     text = _read_text(file_path, text_encoding)
     base_attempt = dict(settings)
     if device_mode == "cross_device":
-        base_attempt["device"] = "cpu"
+        accel_device = _preferred_accelerator_device()
+        det_mode = _resolve_determinism_mode(base_attempt)
+        # For determinism-mode CUDA trials, keep both phases on accelerator/vLLM.
+        if _should_use_vllm(base_attempt, accel_device, det_mode):
+            base_attempt["device"] = accel_device
+        else:
+            base_attempt["device"] = "cpu"
     attempts = [base_attempt]
 
     if bool(settings.get("enable_oom_fallback", True)):
-        fallback_attempt = _build_oom_fallback_settings(settings)
+        fallback_attempt = _build_oom_fallback_settings(base_attempt)
         if fallback_attempt != base_attempt:
             attempts.append(fallback_attempt)
 
