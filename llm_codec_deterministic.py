@@ -1,6 +1,7 @@
 import gc
 import csv
 import importlib
+import importlib.util
 import math
 import os
 import sys
@@ -19,7 +20,28 @@ from arithmetic_coding import Coder
 from bitReadWrite import BitReader, BitWriter
 from decoder import Decoder
 from encoder import Encoder
-from utils import counts_to_cum_desc, probs_to_counts, probs_to_counts_legacy
+
+
+def _load_project_utils_module():
+    module_name = "_project_utils_local"
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+
+    utils_path = Path(__file__).resolve().with_name("utils.py")
+    spec = importlib.util.spec_from_file_location(module_name, str(utils_path))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Failed to load project utils module at {utils_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    sys.modules[module_name] = module
+    return module
+
+
+_project_utils = _load_project_utils_module()
+counts_to_cum_desc = _project_utils.counts_to_cum_desc
+probs_to_counts = _project_utils.probs_to_counts
+probs_to_counts_legacy = _project_utils.probs_to_counts_legacy
 
 try:
     from transformers.cache_utils import DynamicCache
