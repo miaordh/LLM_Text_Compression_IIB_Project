@@ -213,11 +213,23 @@ class _VLLMLogitsBackend:
 
     def next_logits(self, prefix_ids: Sequence[int]) -> torch.Tensor:
         prompt_ids = self._prompt_ids(prefix_ids)
-        outputs = self._llm.generate(
-            prompt_token_ids=[prompt_ids],
-            sampling_params=self._sampling_params,
-            use_tqdm=False,
-        )
+
+        try:
+            outputs = self._llm.generate(
+                prompt_token_ids=[prompt_ids],
+                sampling_params=self._sampling_params,
+                use_tqdm=False,
+            )
+        except TypeError as exc:
+            if "prompt_token_ids" in str(exc):
+                outputs = self._llm.generate(
+                    prompt=[prompt_ids],
+                    sampling_params=self._sampling_params,
+                    use_tqdm=False,
+                )
+            else:
+                raise
+
         if not outputs or not outputs[0].outputs:
             raise RuntimeError("vLLM returned empty outputs while requesting next-token logits")
 
