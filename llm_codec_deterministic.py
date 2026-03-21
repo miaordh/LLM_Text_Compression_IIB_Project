@@ -149,6 +149,7 @@ class _VLLMLogitsBackend:
         tensor_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.9,
         max_logprobs: Optional[int] = None,
+        max_model_len: Optional[int] = None,
     ):
         try:
             from vllm import LLM, SamplingParams
@@ -184,6 +185,8 @@ class _VLLMLogitsBackend:
 
         if torch_dtype in {"float16", "bfloat16", "float32"}:
             engine_kwargs["dtype"] = torch_dtype
+        if max_model_len is not None and int(max_model_len) > 0:
+            engine_kwargs["max_model_len"] = int(max_model_len)
 
         self._llm = LLM(**engine_kwargs)
         self._sampling_params = SamplingParams(
@@ -362,6 +365,7 @@ class DeterministicCodecConfig:
     vllm_tensor_parallel_size: int = 1
     vllm_gpu_memory_utilization: float = 0.9
     vllm_max_logprobs: Optional[int] = None
+    vllm_max_model_len: Optional[int] = None
 
 
 class DeterministicLLMCodec:
@@ -434,6 +438,10 @@ class DeterministicLLMCodec:
             model_id = self.config.model_id
             if not model_id:
                 raise ValueError("vLLM backend requires config.model_id")
+            effective_max_model_len = self.config.vllm_max_model_len
+            if effective_max_model_len is None:
+                # Keep KV cache sized to the codec's actual context needs by default.
+                effective_max_model_len = max(256, int(self.config.context_window))
             self._vllm_backend = _VLLMLogitsBackend(
                 model_id=str(model_id),
                 tokenizer=self.tokenizer,
@@ -444,6 +452,7 @@ class DeterministicLLMCodec:
                 tensor_parallel_size=int(self.config.vllm_tensor_parallel_size),
                 gpu_memory_utilization=float(self.config.vllm_gpu_memory_utilization),
                 max_logprobs=self.config.vllm_max_logprobs,
+                max_model_len=effective_max_model_len,
             )
 
     def _resolve_inference_backend(self) -> str:

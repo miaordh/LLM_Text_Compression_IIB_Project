@@ -200,6 +200,7 @@ def _build_codec_config(
         vllm_tensor_parallel_size=int(runtime_settings.get("vllm_tensor_parallel_size", 1)),
         vllm_gpu_memory_utilization=float(runtime_settings.get("vllm_gpu_memory_utilization", 0.9)),
         vllm_max_logprobs=runtime_settings.get("vllm_max_logprobs"),
+        vllm_max_model_len=runtime_settings.get("vllm_max_model_len"),
         drift_correction_enabled=bool(trial.get("drift_correction_enabled", True)),
         drift_measurements_csv_prefix=drift_prefix,
         encoder_trace_csv_prefix=trace_prefix,

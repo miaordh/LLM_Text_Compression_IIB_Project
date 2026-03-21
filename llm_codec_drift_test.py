@@ -63,6 +63,7 @@ class DriftTestCodecConfig:
     vllm_tensor_parallel_size: int = 1
     vllm_gpu_memory_utilization: float = 0.9
     vllm_max_logprobs: Optional[int] = None
+    vllm_max_model_len: Optional[int] = None
 
     # Drift-test specific knobs
     drift_correction_enabled: bool = True
@@ -112,6 +113,7 @@ class DriftAwareLLMCodec:
                 vllm_tensor_parallel_size=int(getattr(self.config, "vllm_tensor_parallel_size", 1)),
                 vllm_gpu_memory_utilization=float(getattr(self.config, "vllm_gpu_memory_utilization", 0.9)),
                 vllm_max_logprobs=getattr(self.config, "vllm_max_logprobs", None),
+                vllm_max_model_len=getattr(self.config, "vllm_max_model_len", None),
             ),
         )
         self.device = self.base.device

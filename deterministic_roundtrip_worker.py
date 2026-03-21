@@ -262,6 +262,7 @@ def _load_codec(settings: Dict[str, Any]) -> DeterministicLLMCodec:
         vllm_tensor_parallel_size=int(settings.get("vllm_tensor_parallel_size", 1)),
         vllm_gpu_memory_utilization=float(settings.get("vllm_gpu_memory_utilization", 0.9)),
         vllm_max_logprobs=settings.get("vllm_max_logprobs"),
+        vllm_max_model_len=settings.get("vllm_max_model_len"),
     )
 
     return DeterministicLLMCodec(tokenizer=tokenizer, model=model, device=device, config=config)
@@ -347,6 +348,7 @@ def _phase_encode(config: Dict[str, Any], file_path: Path, artifact_dir: Path):
                         attempt_settings.get("vllm_gpu_memory_utilization", 0.9)
                     ),
                     "vllm_max_logprobs": attempt_settings.get("vllm_max_logprobs"),
+                    "vllm_max_model_len": attempt_settings.get("vllm_max_model_len"),
                     "context_window": int(attempt_settings.get("context_window", 2048)),
                     "margin": int(attempt_settings.get("margin", 128)),
                     "strategy": str(attempt_settings.get("strategy", "rolling")),

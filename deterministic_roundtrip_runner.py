@@ -46,6 +46,8 @@ VLLM_TENSOR_PARALLEL_SIZE = 1
 VLLM_GPU_MEMORY_UTILIZATION = 0.9
 # None -> use tokenizer vocab size as max_logprobs for full-distribution reconstruction.
 VLLM_MAX_LOGPROBS = None
+# None -> codec defaults to context_window for safer KV cache sizing.
+VLLM_MAX_MODEL_LEN = None
 MAX_DECODE_TOKENS = None
 DIAGNOSTICS_ENABLED = True
 # Optional diagnostics CSV prefix. If None and diagnostics is enabled, worker writes
@@ -219,6 +221,7 @@ def main():
         "vllm_tensor_parallel_size": VLLM_TENSOR_PARALLEL_SIZE,
         "vllm_gpu_memory_utilization": VLLM_GPU_MEMORY_UTILIZATION,
         "vllm_max_logprobs": VLLM_MAX_LOGPROBS,
+        "vllm_max_model_len": VLLM_MAX_MODEL_LEN,
         "max_decode_tokens": MAX_DECODE_TOKENS,
         "diagnostics_enabled": DIAGNOSTICS_ENABLED,
         "diagnostics_csv_prefix": DIAGNOSTICS_CSV_PREFIX,
