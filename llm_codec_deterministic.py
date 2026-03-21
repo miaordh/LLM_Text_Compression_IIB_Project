@@ -816,6 +816,18 @@ class DeterministicLLMCodec:
             self._batch_invariant_enabled = True
             self._batch_invariant_ctx = lambda _enabled=True: nullcontext()
             self._log_softmax_fn = _cpu_batch_invariant_log_softmax
+            
+            try:
+                import sys
+                from pathlib import Path
+                cpu_ops_path = str(Path(__file__).resolve().parent / "cpu_batch_invariant_ops")
+                if cpu_ops_path not in sys.path:
+                    sys.path.append(cpu_ops_path)
+                from patch_cpu_determinism import patch_llama_for_cpu_determinism
+                patch_llama_for_cpu_determinism()
+            except Exception as e:
+                print(f"Warning: Failed to initialize CPU deep deterministic patch: {e}")
+                
             return
 
         if self._determinism_mode == "tbik":
@@ -823,6 +835,18 @@ class DeterministicLLMCodec:
                 self._batch_invariant_enabled = True
                 self._batch_invariant_ctx = lambda _enabled=True: nullcontext()
                 self._log_softmax_fn = _cpu_batch_invariant_log_softmax
+                
+                try:
+                    import sys
+                    from pathlib import Path
+                    cpu_ops_path = str(Path(__file__).resolve().parent / "cpu_batch_invariant_ops")
+                    if cpu_ops_path not in sys.path:
+                        sys.path.append(cpu_ops_path)
+                    from patch_cpu_determinism import patch_llama_for_cpu_determinism
+                    patch_llama_for_cpu_determinism()
+                except Exception as e:
+                    print(f"Warning: Failed to initialize CPU deep deterministic patch: {e}")
+                    
                 return
             _apply_tbik_patches()
 

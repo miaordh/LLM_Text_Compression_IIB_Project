@@ -1,0 +1,17 @@
+# Build artifacts
+build/
+*.so
+*.dylib
+*.pyd
+*.o
+*.obj
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Distribution/packaging
+*.egg-info/
+.eggs/
+dist/
