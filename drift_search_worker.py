@@ -251,38 +251,38 @@ def _run_trial_on_file(
     dec_use_vllm = False
 
     try:
-    enc_tokenizer, enc_model, enc_use_vllm = _load_model_tokenizer(trial_runtime_settings, encode_device)
-    try:
-        encode_codec = DriftAwareLLMCodec(
-            tokenizer=enc_tokenizer,
-            model=enc_model,
-            device=encode_device,
-            config=_build_codec_config(
-                trial,
-                trial_runtime_settings,
-                enc_use_vllm,
-                diagnostics_prefix,
-                trace_prefix,
-                drift_prefix,
-            ),
-        )
-    except Exception as e:
-        print(f"Failed to initialize vLLM for encode due to: {e}. Falling back to HuggingFace.")
-        trial_runtime_settings["inference_backend"] = "huggingface"
         enc_tokenizer, enc_model, enc_use_vllm = _load_model_tokenizer(trial_runtime_settings, encode_device)
-        encode_codec = DriftAwareLLMCodec(
-            tokenizer=enc_tokenizer,
-            model=enc_model,
-            device=encode_device,
-            config=_build_codec_config(
-                trial,
-                trial_runtime_settings,
-                enc_use_vllm,
-                diagnostics_prefix,
-                trace_prefix,
-                drift_prefix,
-            ),
-        )
+        try:
+            encode_codec = DriftAwareLLMCodec(
+                tokenizer=enc_tokenizer,
+                model=enc_model,
+                device=encode_device,
+                config=_build_codec_config(
+                    trial,
+                    trial_runtime_settings,
+                    enc_use_vllm,
+                    diagnostics_prefix,
+                    trace_prefix,
+                    drift_prefix,
+                ),
+            )
+        except Exception as e:
+            print(f"Failed to initialize vLLM for encode due to: {e}. Falling back to HuggingFace.")
+            trial_runtime_settings["inference_backend"] = "huggingface"
+            enc_tokenizer, enc_model, enc_use_vllm = _load_model_tokenizer(trial_runtime_settings, encode_device)
+            encode_codec = DriftAwareLLMCodec(
+                tokenizer=enc_tokenizer,
+                model=enc_model,
+                device=encode_device,
+                config=_build_codec_config(
+                    trial,
+                    trial_runtime_settings,
+                    enc_use_vllm,
+                    diagnostics_prefix,
+                    trace_prefix,
+                    drift_prefix,
+                ),
+            )
 
         t0 = time.time()
         encoded_bytes, num_tokens, reference_rows = encode_codec.encode_with_trace(
