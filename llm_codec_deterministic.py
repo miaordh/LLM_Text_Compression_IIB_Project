@@ -214,21 +214,50 @@ class _VLLMLogitsBackend:
     def next_logits(self, prefix_ids: Sequence[int]) -> torch.Tensor:
         prompt_ids = self._prompt_ids(prefix_ids)
 
-        try:
-            outputs = self._llm.generate(
+        outputs = None
+        last_type_error = None
+
+        # vLLM API has changed across releases; try common signatures in order.
+        generate_attempts = [
+            lambda: self._llm.generate(
                 prompt_token_ids=[prompt_ids],
                 sampling_params=self._sampling_params,
                 use_tqdm=False,
-            )
-        except TypeError as exc:
-            if "prompt_token_ids" in str(exc):
-                outputs = self._llm.generate(
-                    prompt=[prompt_ids],
-                    sampling_params=self._sampling_params,
-                    use_tqdm=False,
-                )
-            else:
-                raise
+            ),
+            lambda: self._llm.generate(
+                prompt=[prompt_ids],
+                sampling_params=self._sampling_params,
+                use_tqdm=False,
+            ),
+            lambda: self._llm.generate(
+                prompts=[prompt_ids],
+                sampling_params=self._sampling_params,
+                use_tqdm=False,
+            ),
+            lambda: self._llm.generate(
+                [{"prompt_token_ids": prompt_ids}],
+                self._sampling_params,
+                use_tqdm=False,
+            ),
+            lambda: self._llm.generate(
+                [prompt_ids],
+                self._sampling_params,
+                use_tqdm=False,
+            ),
+        ]
+
+        for attempt in generate_attempts:
+            try:
+                outputs = attempt()
+                break
+            except TypeError as exc:
+                last_type_error = exc
+                continue
+
+        if outputs is None:
+            if last_type_error is not None:
+                raise last_type_error
+            raise RuntimeError("vLLM generate returned no result and no TypeError was captured")
 
         if not outputs or not outputs[0].outputs:
             raise RuntimeError("vLLM returned empty outputs while requesting next-token logits")
