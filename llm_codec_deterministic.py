@@ -497,10 +497,10 @@ class DeterministicLLMCodec:
 
         if self._determinism_mode is None:
             return "huggingface"
-        if self.device.type != "cuda":
-            return "huggingface"
-        if not _triton_is_available():
-            return "huggingface"
+            
+        # As requested: forcefully try vLLM if determinism_mode is set.
+        # Fallback to HuggingFace only occurs via error catching during initialization elsewhere, 
+        # or if determinism_mode is None.
         return "vllm"
 
     def _resolve_existing_eof_token_id(self) -> int:

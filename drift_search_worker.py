@@ -124,7 +124,11 @@ def _should_use_vllm(settings: Dict[str, Any], device: str, determinism_mode: Op
     if backend not in {"", "auto"}:
         raise ValueError("Unsupported inference_backend. Expected one of: auto, huggingface, vllm")
 
-    return bool(determinism_mode in {"batch_invariant_ops", "tbik"} and device == "cuda" and _triton_available())
+    # Force try vLLM if determinism mode is requested, ignoring device type or triton check upfront.
+    # It will fallback properly in main initialization if it fails.
+    if determinism_mode is None:
+        return False
+    return True
 
 
 def _load_model_tokenizer(settings: Dict[str, Any], device: str):
@@ -228,20 +232,10 @@ def _run_trial_on_file(
 
     trial_runtime_settings = dict(global_settings)
     trial_runtime_settings["determinism_mode"] = trial.get("determinism_mode")
-    trial_determinism_mode = trial_runtime_settings["determinism_mode"]
-    if trial_determinism_mode is not None:
-        trial_determinism_mode = str(trial_determinism_mode).strip().lower()
-        if trial_determinism_mode in {"", "none", "off", "false", "0"}:
-            trial_determinism_mode = None
 
     if device_mode == "cross_device":
-        accel_device = _preferred_accelerator_device()
-        if _should_use_vllm(trial_runtime_settings, accel_device, trial_determinism_mode):
-            encode_device = accel_device
-            decode_device = accel_device
-        else:
-            encode_device = "cpu"
-            decode_device = accel_device
+        encode_device = "cpu"
+        decode_device = _preferred_accelerator_device()
     else:
         encode_device = base_device
         decode_device = base_device
@@ -257,6 +251,24 @@ def _run_trial_on_file(
     dec_use_vllm = False
 
     try:
+    enc_tokenizer, enc_model, enc_use_vllm = _load_model_tokenizer(trial_runtime_settings, encode_device)
+    try:
+        encode_codec = DriftAwareLLMCodec(
+            tokenizer=enc_tokenizer,
+            model=enc_model,
+            device=encode_device,
+            config=_build_codec_config(
+                trial,
+                trial_runtime_settings,
+                enc_use_vllm,
+                diagnostics_prefix,
+                trace_prefix,
+                drift_prefix,
+            ),
+        )
+    except Exception as e:
+        print(f"Failed to initialize vLLM for encode due to: {e}. Falling back to HuggingFace.")
+        trial_runtime_settings["inference_backend"] = "huggingface"
         enc_tokenizer, enc_model, enc_use_vllm = _load_model_tokenizer(trial_runtime_settings, encode_device)
         encode_codec = DriftAwareLLMCodec(
             tokenizer=enc_tokenizer,
@@ -282,19 +294,37 @@ def _run_trial_on_file(
         encode_seconds = time.time() - t0
 
         dec_tokenizer, dec_model, dec_use_vllm = _load_model_tokenizer(trial_runtime_settings, decode_device)
-        decode_codec = DriftAwareLLMCodec(
-            tokenizer=dec_tokenizer,
-            model=dec_model,
-            device=decode_device,
-            config=_build_codec_config(
-                trial,
-                trial_runtime_settings,
-                dec_use_vllm,
-                diagnostics_prefix,
-                trace_prefix,
-                drift_prefix,
-            ),
-        )
+        try:
+            decode_codec = DriftAwareLLMCodec(
+                tokenizer=dec_tokenizer,
+                model=dec_model,
+                device=decode_device,
+                config=_build_codec_config(
+                    trial,
+                    trial_runtime_settings,
+                    dec_use_vllm,
+                    diagnostics_prefix,
+                    trace_prefix,
+                    drift_prefix,
+                ),
+            )
+        except Exception as e:
+            print(f"Failed to initialize vLLM for decode due to: {e}. Falling back to HuggingFace.")
+            trial_runtime_settings["inference_backend"] = "huggingface"
+            dec_tokenizer, dec_model, dec_use_vllm = _load_model_tokenizer(trial_runtime_settings, decode_device)
+            decode_codec = DriftAwareLLMCodec(
+                tokenizer=dec_tokenizer,
+                model=dec_model,
+                device=decode_device,
+                config=_build_codec_config(
+                    trial,
+                    trial_runtime_settings,
+                    dec_use_vllm,
+                    diagnostics_prefix,
+                    trace_prefix,
+                    drift_prefix,
+                ),
+            )
 
         t1 = time.time()
         decoded_text, drift_rows = decode_codec.decode_with_reference(

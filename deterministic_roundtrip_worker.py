@@ -116,7 +116,10 @@ def _should_use_vllm(settings: Dict[str, Any], device: str, determinism_mode: Op
     if backend not in {"", "auto"}:
         raise ValueError("Unsupported inference_backend. Expected one of: auto, huggingface, vllm")
 
-    return bool(determinism_mode in {"batch_invariant_ops", "tbik"} and device == "cuda" and _triton_available())
+    # Force try vLLM if determinism mode is requested, ignoring device type or triton check upfront.
+    if determinism_mode is None:
+        return False
+    return True
 
 
 def _is_cuda_oom(exc: BaseException) -> bool:
@@ -231,41 +234,50 @@ def _load_codec(settings: Dict[str, Any]) -> DeterministicLLMCodec:
             "Use slots >= vocab size (for example 1<<18 or 1<<20 for ~150k vocab)."
         )
 
-    model = None
-    if not use_vllm:
-        try:
-            model = AutoModelForCausalLM.from_pretrained(settings["model_id"], **model_kwargs)
-        except TypeError:
-            if "dtype" not in model_kwargs:
-                raise
-            fallback_kwargs = dict(model_kwargs)
-            fallback_kwargs["torch_dtype"] = fallback_kwargs.pop("dtype")
-            model = AutoModelForCausalLM.from_pretrained(settings["model_id"], **fallback_kwargs)
+    def _attempt_load(vllm_flag: bool) -> DeterministicLLMCodec:
+        model = None
+        if not vllm_flag:
+            try:
+                model = AutoModelForCausalLM.from_pretrained(settings["model_id"], **model_kwargs)
+            except TypeError:
+                if "dtype" not in model_kwargs:
+                    raise
+                fallback_kwargs = dict(model_kwargs)
+                fallback_kwargs["torch_dtype"] = fallback_kwargs.pop("dtype")
+                model = AutoModelForCausalLM.from_pretrained(settings["model_id"], **fallback_kwargs)
 
-    config = DeterministicCodecConfig(
-        precision=int(settings.get("precision", 32)),
-        slots=int(settings.get("slots", 1 << 24)),
-        context_window=int(settings.get("context_window", 2048)),
-        margin=int(settings.get("margin", 128)),
-        strategy=str(settings.get("strategy", "rolling")),
-        use_legacy_counts=bool(settings.get("use_legacy_counts", False)),
-        quant=bool(settings.get("quant", False)),
-        logit_round_decimals=int(settings.get("logit_round_decimals", 2)),
-        prob_round_decimals=int(settings.get("prob_round_decimals", 5)),
-        diagnostics_csv_prefix=settings.get("diagnostics_csv_prefix"),
-        determinism_mode=determinism_mode,
-        inference_backend="vllm" if use_vllm else "huggingface",
-        model_id=str(settings.get("model_id")),
-        trust_remote_code=bool(settings.get("trust_remote_code", False)),
-        revision=revision,
-        torch_dtype=torch_dtype_name,
-        vllm_tensor_parallel_size=int(settings.get("vllm_tensor_parallel_size", 1)),
-        vllm_gpu_memory_utilization=float(settings.get("vllm_gpu_memory_utilization", 0.9)),
-        vllm_max_logprobs=settings.get("vllm_max_logprobs"),
-        vllm_max_model_len=settings.get("vllm_max_model_len"),
-    )
+        config = DeterministicCodecConfig(
+            precision=int(settings.get("precision", 32)),
+            slots=int(settings.get("slots", 1 << 24)),
+            context_window=int(settings.get("context_window", 2048)),
+            margin=int(settings.get("margin", 128)),
+            strategy=str(settings.get("strategy", "rolling")),
+            use_legacy_counts=bool(settings.get("use_legacy_counts", False)),
+            quant=bool(settings.get("quant", False)),
+            logit_round_decimals=int(settings.get("logit_round_decimals", 2)),
+            prob_round_decimals=int(settings.get("prob_round_decimals", 5)),
+            diagnostics_csv_prefix=settings.get("diagnostics_csv_prefix"),
+            determinism_mode=determinism_mode,
+            inference_backend="vllm" if vllm_flag else "huggingface",
+            model_id=str(settings.get("model_id")),
+            trust_remote_code=bool(settings.get("trust_remote_code", False)),
+            revision=revision,
+            torch_dtype=torch_dtype_name,
+            vllm_tensor_parallel_size=int(settings.get("vllm_tensor_parallel_size", 1)),
+            vllm_gpu_memory_utilization=float(settings.get("vllm_gpu_memory_utilization", 0.9)),
+            vllm_max_logprobs=settings.get("vllm_max_logprobs"),
+            vllm_max_model_len=settings.get("vllm_max_model_len"),
+        )
+        return DeterministicLLMCodec(tokenizer=tokenizer, model=model, device=device, config=config)
 
-    return DeterministicLLMCodec(tokenizer=tokenizer, model=model, device=device, config=config)
+    try:
+        return _attempt_load(vllm_flag=use_vllm)
+    except Exception as e:
+        if use_vllm:
+            print(f"Failed to initialize codec with vLLM backend due to: {e}. Falling back to HuggingFace.")
+            settings["inference_backend"] = "huggingface"
+            return _attempt_load(vllm_flag=False)
+        raise
 
 
 def _phase_encode(config: Dict[str, Any], file_path: Path, artifact_dir: Path):
@@ -284,17 +296,11 @@ def _phase_encode(config: Dict[str, Any], file_path: Path, artifact_dir: Path):
     text = _read_text(file_path, text_encoding)
     base_attempt = dict(settings)
     if device_mode == "cross_device":
-        accel_device = _preferred_accelerator_device()
-        det_mode = _resolve_determinism_mode(base_attempt)
-        # For determinism-mode CUDA trials, keep both phases on accelerator/vLLM.
-        if _should_use_vllm(base_attempt, accel_device, det_mode):
-            base_attempt["device"] = accel_device
-        else:
-            base_attempt["device"] = "cpu"
+        base_attempt["device"] = "cpu"
     attempts = [base_attempt]
 
     if bool(settings.get("enable_oom_fallback", True)):
-        fallback_attempt = _build_oom_fallback_settings(base_attempt)
+        fallback_attempt = _build_oom_fallback_settings(settings)
         if fallback_attempt != base_attempt:
             attempts.append(fallback_attempt)
 
