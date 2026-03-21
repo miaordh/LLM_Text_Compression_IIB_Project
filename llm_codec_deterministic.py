@@ -138,6 +138,11 @@ def _triton_is_available() -> bool:
 
 
 class _VLLMLogitsBackend:
+    @staticmethod
+    def _is_gpu_utilization_startup_error(exc: BaseException) -> bool:
+        text = str(exc).lower()
+        return ("free memory on device" in text) and ("gpu memory utilization" in text)
+
     def __init__(
         self,
         model_id: str,
@@ -188,7 +193,33 @@ class _VLLMLogitsBackend:
         if max_model_len is not None and int(max_model_len) > 0:
             engine_kwargs["max_model_len"] = int(max_model_len)
 
-        self._llm = LLM(**engine_kwargs)
+        requested_gpu_util = float(gpu_memory_utilization)
+        util_candidates: List[float] = []
+        for candidate in (requested_gpu_util, min(requested_gpu_util, 0.90), 0.85, 0.80):
+            if 0.50 <= float(candidate) <= 0.99 and all(abs(candidate - u) > 1e-9 for u in util_candidates):
+                util_candidates.append(float(candidate))
+
+        self._llm = None
+        last_exc = None
+        for util in util_candidates:
+            try:
+                engine_kwargs["gpu_memory_utilization"] = float(util)
+                self._llm = LLM(**engine_kwargs)
+                break
+            except Exception as exc:
+                last_exc = exc
+                if not self._is_gpu_utilization_startup_error(exc):
+                    raise
+                continue
+
+        if self._llm is None:
+            tried = ", ".join(f"{u:.2f}" for u in util_candidates)
+            if last_exc is not None:
+                raise RuntimeError(
+                    f"vLLM engine initialization failed after retrying gpu_memory_utilization values: {tried}"
+                ) from last_exc
+            raise RuntimeError("vLLM engine initialization failed with unknown error")
+
         self._sampling_params = SamplingParams(
             temperature=0.0,
             top_p=1.0,
