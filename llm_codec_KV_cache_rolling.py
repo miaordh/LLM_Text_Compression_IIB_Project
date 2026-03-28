@@ -176,8 +176,7 @@ class LLM_Encode_KV_Cache(_KVCacheMixin):
         token_ids.append(eof_token_id)
 
         bit_writer = BitWriter()
-        coder_enc = Coder(b=self.precision)
-        enc = Encoder(coder_enc, bit_writer)
+        enc = Encoder(bit_writer, b=self.precision)
         
         # Use Safe Slots (1 << 24) to prevent Register Underflow with precision=32
         slots = 1 << 24 
@@ -262,8 +261,7 @@ class LLM_Decode_KV_Cache(_KVCacheMixin):
 
     def decode(self, encoded_bytes):
         bit_reader = BitReader(encoded_bytes)
-        coder_dec = Coder(b=self.precision)
-        dec = Decoder(coder_dec, bit_reader)
+        dec = Decoder(bit_reader, b=self.precision)
 
         decoded_token_ids = []
         # Must match Encoder slots exactly

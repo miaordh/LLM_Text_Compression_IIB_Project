@@ -699,7 +699,7 @@ class APILLMCodec:
             token_ids = token_ids + [self.eof_token_id]
 
         writer = BitWriter()
-        enc = Encoder(Coder(b=self.config.precision), writer)
+        enc = Encoder(writer, b=self.config.precision)
         iterator = enumerate(token_ids)
         if show_progress:
             iterator = tqdm(iterator, total=len(token_ids), desc="API Encode")
@@ -710,8 +710,8 @@ class APILLMCodec:
                 raw_probs, probs = self._probs_for_position(token_ids, idx)
                 counts = self._counts_from_probs(probs)
 
-                coder_L_before = int(enc.coder.L)
-                coder_R_before = int(enc.coder.R)
+                coder_L_before = int(enc.L)
+                coder_R_before = int(enc.R)
                 self._write_token_diagnostic(
                     diag_writer,
                     phase="encode",
@@ -746,7 +746,7 @@ class APILLMCodec:
         expected_num_tokens: Optional[int] = None,
         show_progress: bool = True,
     ) -> str:
-        dec = Decoder(Coder(b=self.config.precision), BitReader(encoded_bytes))
+        dec = Decoder(BitReader(encoded_bytes), b=self.config.precision)
         decoded_ids: List[int] = []
         diag_handle, diag_writer = self._open_diagnostics_writer("decode")
 
@@ -770,9 +770,9 @@ class APILLMCodec:
                     raw_probs, probs = self._probs_for_position(decoded_ids, idx)
                     counts = self._counts_from_probs(probs)
 
-                    coder_L_before = int(dec.coder.L)
-                    coder_R_before = int(dec.coder.R)
-                    coder_D_before = int(dec.coder.D)
+                    coder_L_before = int(dec.L)
+                    coder_R_before = int(dec.R)
+                    coder_D_before = int(dec.D)
                     token_id = dec.decode_symbol(counts_to_cum_desc(counts))
 
                     self._write_token_diagnostic(
@@ -806,9 +806,9 @@ class APILLMCodec:
                 raw_probs, probs = self._probs_for_position(decoded_ids, idx)
                 counts = self._counts_from_probs(probs)
 
-                coder_L_before = int(dec.coder.L)
-                coder_R_before = int(dec.coder.R)
-                coder_D_before = int(dec.coder.D)
+                coder_L_before = int(dec.L)
+                coder_R_before = int(dec.R)
+                coder_D_before = int(dec.D)
                 token_id = dec.decode_symbol(counts_to_cum_desc(counts))
 
                 self._write_token_diagnostic(

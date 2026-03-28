@@ -1,11 +1,7 @@
 import gc
-import csv
-import importlib
 import importlib.util
 import math
-import os
 import sys
-import threading
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -15,8 +11,20 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 import torch
 from tqdm import tqdm
+from determinism_utils import (
+    VLLMLogitsBackend,
+    configure_determinism_runtime,
+    normalize_determinism_mode,
+)
+from diagnostics import (
+    DiagnosticsWriter,
+    maybe_write_divergence_rows,
+    start_memory_monitor,
+    stop_memory_monitor,
+    token_text_for_diag,
+    write_csv_rows,
+)
 
-from arithmetic_coding import Coder
 from bitReadWrite import BitReader, BitWriter
 from decoder import Decoder
 from encoder import Encoder
@@ -49,324 +57,6 @@ try:
     HAS_DYNAMIC_CACHE = True
 except ImportError:
     HAS_DYNAMIC_CACHE = False
-
-
-def _normalize_determinism_mode(mode: Optional[str]) -> Optional[str]:
-    if mode is None:
-        return None
-    normalized = str(mode).strip().lower()
-    if normalized in {"", "none", "off", "false", "0"}:
-        return None
-    if normalized not in {"batch_invariant_ops", "tbik"}:
-        raise ValueError(
-            "Unsupported determinism_mode. Expected one of: None, batch_invariant_ops, tbik"
-        )
-    return normalized
-
-
-def _add_llm_reproducibility_paths() -> bool:
-    root = Path(__file__).resolve().parent / "llm_reproducibility"
-    src_dir = root / "src"
-    added = False
-    for candidate in (root, src_dir):
-        if candidate.exists():
-            candidate_str = str(candidate)
-            if candidate_str not in sys.path:
-                sys.path.insert(0, candidate_str)
-            added = True
-    return added
-
-
-def _import_batch_invariant_backend(prefer_repo_backend: bool = False):
-    def _load_from_module(module_name: str):
-        try:
-            mod = importlib.import_module(module_name)
-        except Exception:
-            return None, None
-        return getattr(mod, "set_batch_invariant_mode", None), getattr(mod, "log_softmax", None)
-
-    if prefer_repo_backend and _add_llm_reproducibility_paths():
-        set_mode, log_softmax = _load_from_module("bio.batch_invariant_ops")
-        if set_mode is not None and log_softmax is not None:
-            return set_mode, log_softmax
-
-    set_mode, log_softmax = _load_from_module("batch_invariant_ops")
-    if set_mode is not None and log_softmax is not None:
-        return set_mode, log_softmax
-
-    set_mode, log_softmax = _load_from_module("batch_invariant_ops.batch_invariant_ops")
-    if set_mode is not None and log_softmax is not None:
-        return set_mode, log_softmax
-
-    if _add_llm_reproducibility_paths():
-        set_mode, log_softmax = _load_from_module("bio.batch_invariant_ops")
-        if set_mode is not None and log_softmax is not None:
-            return set_mode, log_softmax
-
-    return None, None
-
-
-def _apply_tbik_patches():
-    if not _add_llm_reproducibility_paths():
-        raise RuntimeError(
-            "determinism_mode='tbik' requires the llm_reproducibility repository at ./llm_reproducibility"
-        )
-
-    os.environ["VLLM_BATCH_INVARIANT"] = "1"
-    os.environ["VLLM_TP_INVARIANT"] = "1"
-
-    try:
-        patch_module = importlib.import_module("src.patch")
-        apply_patches = getattr(patch_module, "apply_patches")
-    except Exception as exc:
-        raise RuntimeError(
-            "Failed to import TBIK patch entrypoint from llm_reproducibility. "
-            "Install dependencies for that repo (for example vllm, triton, and optional mini_allreduce)."
-        ) from exc
-
-    try:
-        apply_patches()
-    except Exception as exc:
-        raise RuntimeError(
-            "Failed to apply TBIK patches. This usually means vLLM/Triton dependencies are missing "
-            "or incompatible with the current environment."
-        ) from exc
-
-
-def _triton_is_available() -> bool:
-    return importlib.util.find_spec("triton") is not None
-
-
-class _VLLMLogitsBackend:
-    @staticmethod
-    def _is_gpu_utilization_startup_error(exc: BaseException) -> bool:
-        text = str(exc).lower()
-        return ("free memory on device" in text) and ("gpu memory utilization" in text)
-
-    def __init__(
-        self,
-        model_id: str,
-        tokenizer,
-        device: torch.device,
-        trust_remote_code: bool = False,
-        revision: Optional[str] = None,
-        torch_dtype: str = "auto",
-        tensor_parallel_size: int = 1,
-        gpu_memory_utilization: float = 0.9,
-        max_logprobs: Optional[int] = None,
-        max_model_len: Optional[int] = None,
-    ):
-        try:
-            from vllm import LLM, SamplingParams
-        except Exception as exc:
-            raise RuntimeError(
-                "vLLM backend requested, but vllm is not importable. Install vllm on CUDA Linux."
-            ) from exc
-
-        if device.type != "cuda":
-            raise RuntimeError("vLLM backend currently requires CUDA device")
-
-        self._tokenizer = tokenizer
-        self._device = device
-        self._vocab_size = int(len(tokenizer))
-        self._bos_token_id = getattr(tokenizer, "bos_token_id", None)
-        self._pad_token_id = getattr(tokenizer, "pad_token_id", None)
-        self._max_logprobs = int(max_logprobs) if max_logprobs is not None else int(self._vocab_size)
-        if self._max_logprobs <= 0:
-            self._max_logprobs = int(self._vocab_size)
-
-        engine_kwargs: Dict[str, Any] = {
-            "model": model_id,
-            "trust_remote_code": bool(trust_remote_code),
-            "tensor_parallel_size": max(1, int(tensor_parallel_size)),
-            "gpu_memory_utilization": float(gpu_memory_utilization),
-            "enforce_eager": True,
-            "enable_prefix_caching": False,
-            "max_logprobs": self._max_logprobs,
-            "logprobs_mode": "raw_logprobs",
-        }
-        if revision:
-            engine_kwargs["revision"] = revision
-
-        if torch_dtype in {"float16", "bfloat16", "float32"}:
-            engine_kwargs["dtype"] = torch_dtype
-        if max_model_len is not None and int(max_model_len) > 0:
-            engine_kwargs["max_model_len"] = int(max_model_len)
-
-        requested_gpu_util = float(gpu_memory_utilization)
-        util_candidates: List[float] = []
-        for candidate in (requested_gpu_util, min(requested_gpu_util, 0.90), 0.85, 0.80):
-            if 0.50 <= float(candidate) <= 0.99 and all(abs(candidate - u) > 1e-9 for u in util_candidates):
-                util_candidates.append(float(candidate))
-
-        self._llm = None
-        last_exc = None
-        for util in util_candidates:
-            try:
-                engine_kwargs["gpu_memory_utilization"] = float(util)
-                self._llm = LLM(**engine_kwargs)
-                break
-            except Exception as exc:
-                last_exc = exc
-                if not self._is_gpu_utilization_startup_error(exc):
-                    raise
-                continue
-
-        if self._llm is None:
-            tried = ", ".join(f"{u:.2f}" for u in util_candidates)
-            if last_exc is not None:
-                raise RuntimeError(
-                    f"vLLM engine initialization failed after retrying gpu_memory_utilization values: {tried}"
-                ) from last_exc
-            raise RuntimeError("vLLM engine initialization failed with unknown error")
-
-        self._sampling_params = SamplingParams(
-            temperature=0.0,
-            top_p=1.0,
-            max_tokens=1,
-            seed=1,
-            logprobs=self._max_logprobs,
-            detokenize=False,
-            ignore_eos=True,
-        )
-
-    def _prompt_ids(self, prefix_ids: Sequence[int]) -> List[int]:
-        if prefix_ids:
-            return [int(t) for t in prefix_ids]
-        bos = self._bos_token_id
-        if bos is None:
-            bos = self._pad_token_id
-        if bos is None:
-            bos = 0
-        return [int(bos)]
-
-    def _logprob_value(self, value: Any) -> float:
-        if hasattr(value, "logprob"):
-            return float(value.logprob)
-        return float(value)
-
-    def next_logits(self, prefix_ids: Sequence[int]) -> torch.Tensor:
-        prompt_ids = self._prompt_ids(prefix_ids)
-
-        outputs = None
-        last_type_error = None
-
-        # vLLM API has changed across releases; try common signatures in order.
-        generate_attempts = [
-            lambda: self._llm.generate(
-                prompt_token_ids=[prompt_ids],
-                sampling_params=self._sampling_params,
-                use_tqdm=False,
-            ),
-            lambda: self._llm.generate(
-                prompt=[prompt_ids],
-                sampling_params=self._sampling_params,
-                use_tqdm=False,
-            ),
-            lambda: self._llm.generate(
-                prompts=[prompt_ids],
-                sampling_params=self._sampling_params,
-                use_tqdm=False,
-            ),
-            lambda: self._llm.generate(
-                [{"prompt_token_ids": prompt_ids}],
-                self._sampling_params,
-                use_tqdm=False,
-            ),
-            lambda: self._llm.generate(
-                [prompt_ids],
-                self._sampling_params,
-                use_tqdm=False,
-            ),
-        ]
-
-        for attempt in generate_attempts:
-            try:
-                outputs = attempt()
-                break
-            except TypeError as exc:
-                last_type_error = exc
-                continue
-
-        if outputs is None:
-            if last_type_error is not None:
-                raise last_type_error
-            raise RuntimeError("vLLM generate returned no result and no TypeError was captured")
-
-        if not outputs or not outputs[0].outputs:
-            raise RuntimeError("vLLM returned empty outputs while requesting next-token logits")
-
-        token_logprobs = outputs[0].outputs[0].logprobs
-        if not token_logprobs:
-            raise RuntimeError("vLLM did not return token logprobs for the next token")
-
-        step_dict = token_logprobs[0]
-        probs = np.zeros((self._vocab_size,), dtype=np.float64)
-        assigned = np.zeros((self._vocab_size,), dtype=np.bool_)
-
-        for token_id, payload in step_dict.items():
-            idx = int(token_id)
-            if 0 <= idx < self._vocab_size:
-                lp = self._logprob_value(payload)
-                p = float(np.exp(lp))
-                if p > 0.0:
-                    probs[idx] = p
-                    assigned[idx] = True
-
-        known_mass = float(probs.sum())
-        unknown = int((~assigned).sum())
-        residual = max(0.0, 1.0 - known_mass)
-        if unknown > 0:
-            fill = residual / float(unknown)
-            if fill <= 0.0:
-                fill = 1e-12
-            probs[~assigned] = fill
-
-        total = float(probs.sum())
-        if not np.isfinite(total) or total <= 0.0:
-            probs[:] = 1.0 / float(self._vocab_size)
-        else:
-            probs /= total
-
-        logits = np.log(np.clip(probs, 1e-45, 1.0)).astype(np.float32, copy=False)
-        return torch.from_numpy(logits).to(device=self._device)
-
-
-def _cpu_batch_invariant_log_softmax(input_tensor: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    # Fixed-order two-pass reduction on CPU to reduce sensitivity to reduction-order changes.
-    if dim < 0:
-        dim += input_tensor.ndim
-    if dim < 0 or dim >= input_tensor.ndim:
-        raise ValueError("Invalid dim for log_softmax")
-
-    x = input_tensor
-    moved = False
-    if dim != x.ndim - 1:
-        x = x.movedim(dim, -1)
-        moved = True
-
-    original_shape = x.shape
-    n_cols = int(original_shape[-1])
-    x2 = x.reshape(-1, n_cols)
-    x32 = x2.to(torch.float32)
-
-    block_size = 1024
-    max_vals = torch.full((x32.shape[0],), -float("inf"), dtype=torch.float32, device=x32.device)
-    for start in range(0, n_cols, block_size):
-        block = x32[:, start : start + block_size]
-        max_vals = torch.maximum(max_vals, block.max(dim=1).values)
-
-    sum_exp = torch.zeros((x32.shape[0],), dtype=torch.float32, device=x32.device)
-    for start in range(0, n_cols, block_size):
-        block = x32[:, start : start + block_size]
-        sum_exp = sum_exp + torch.exp(block - max_vals[:, None]).sum(dim=1)
-
-    out32 = x32 - max_vals[:, None] - torch.log(sum_exp)[:, None]
-    out = out32.to(x2.dtype).reshape(original_shape)
-
-    if moved:
-        out = out.movedim(-1, dim)
-    return out
 
 
 @dataclass
@@ -409,6 +99,7 @@ class DeterministicLLMCodec:
     ):
         self.tokenizer = tokenizer
         self.config = config or DeterministicCodecConfig()
+        self._diag_writer = DiagnosticsWriter(self.config.diagnostics_csv_prefix, self.tokenizer)
 
         if device == "auto":
             if torch.cuda.is_available():
@@ -420,7 +111,7 @@ class DeterministicLLMCodec:
         else:
             self.device = torch.device(device)
 
-        self._determinism_mode = _normalize_determinism_mode(self.config.determinism_mode)
+        self._determinism_mode = normalize_determinism_mode(self.config.determinism_mode)
         self._inference_backend = self._resolve_inference_backend()
 
         self.model = None
@@ -464,7 +155,11 @@ class DeterministicLLMCodec:
             except Exception:
                 pass
 
-        self._configure_determinism_runtime()
+        (
+            self._batch_invariant_enabled,
+            self._batch_invariant_ctx,
+            self._log_softmax_fn,
+        ) = configure_determinism_runtime(self.device, self._determinism_mode)
         if self._inference_backend == "vllm":
             model_id = self.config.model_id
             if not model_id:
@@ -473,7 +168,7 @@ class DeterministicLLMCodec:
             if effective_max_model_len is None:
                 # Keep KV cache sized to the codec's actual context needs by default.
                 effective_max_model_len = max(256, int(self.config.context_window))
-            self._vllm_backend = _VLLMLogitsBackend(
+            self._vllm_backend = VLLMLogitsBackend(
                 model_id=str(model_id),
                 tokenizer=self.tokenizer,
                 device=self.device,
@@ -518,358 +213,9 @@ class DeterministicLLMCodec:
             return int(pad_id)
         return 0
 
-    def _diagnostics_enabled(self) -> bool:
-        return bool(self.config.diagnostics_csv_prefix)
-
     @property
     def inference_backend(self) -> str:
         return self._inference_backend
-
-    def _diagnostics_csv_path(self, phase: str) -> Path:
-        base = Path(str(self.config.diagnostics_csv_prefix))
-        if base.suffix.lower() == ".csv":
-            return base.with_name(f"{base.stem}_{phase}.csv")
-        return Path(str(base) + f"_{phase}.csv")
-
-    @staticmethod
-    def _diagnostics_fieldnames():
-        return [
-            "phase",
-            "step_idx",
-            "token_id",
-            "token_text",
-            "coder_D_before",
-            "selected_interval_contains_D",
-            "raw_cum_prob",
-            "effective_cum_prob",
-            "raw_lower_prob",
-            "raw_upper_prob",
-            "effective_lower_prob",
-            "effective_upper_prob",
-            "prev_token_id",
-            "prev_token_text",
-            "raw_prev_lower_prob",
-            "raw_prev_upper_prob",
-            "effective_prev_lower_prob",
-            "effective_prev_upper_prob",
-            "raw_prev_interval_low",
-            "raw_prev_interval_high",
-            "effective_prev_interval_low",
-            "effective_prev_interval_high",
-            "next_token_id",
-            "next_token_text",
-            "raw_next_lower_prob",
-            "raw_next_upper_prob",
-            "effective_next_lower_prob",
-            "effective_next_upper_prob",
-            "raw_next_interval_low",
-            "raw_next_interval_high",
-            "effective_next_interval_low",
-            "effective_next_interval_high",
-            "raw_gap_prev_to_current",
-            "raw_gap_current_to_next",
-            "effective_gap_prev_to_current",
-            "effective_gap_current_to_next",
-            "raw_interval_gap_prev_to_current",
-            "raw_interval_gap_current_to_next",
-            "effective_interval_gap_prev_to_current",
-            "effective_interval_gap_current_to_next",
-            "raw_interval_low",
-            "raw_interval_high",
-            "effective_interval_low",
-            "effective_interval_high",
-            "coder_L_before",
-            "coder_R_before",
-            "rank_raw",
-            "rank_effective",
-            "top1_raw_token_id",
-            "top1_raw_prob",
-            "top1_effective_token_id",
-            "top1_effective_prob",
-            "symbol_count",
-            "counts_total",
-        ]
-
-    def _open_diagnostics_writer(self, phase: str):
-        if not self._diagnostics_enabled():
-            return None, None
-
-        path = self._diagnostics_csv_path(phase)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        handle = path.open("w", encoding="utf-8", newline="")
-        writer = csv.DictWriter(handle, fieldnames=self._diagnostics_fieldnames())
-        writer.writeheader()
-        return handle, writer
-
-    @staticmethod
-    def _token_text_for_diag(tokenizer, token_id: int) -> str:
-        try:
-            return tokenizer.decode([int(token_id)], skip_special_tokens=False).replace("\n", "\\n")
-        except Exception:
-            return ""
-
-    @staticmethod
-    def _rank_from_probs(probs: np.ndarray, token_id: int) -> int:
-        token_prob = float(probs[int(token_id)])
-        return int(np.count_nonzero(probs > token_prob) + 1)
-
-    @staticmethod
-    def _interval_bounds_from_probs(
-        probs: np.ndarray,
-        token_id: int,
-        coder_L: int,
-        coder_R: int,
-    ):
-        token_id = int(token_id)
-        lower_prob = float(np.sum(probs[:token_id]))
-        token_prob = float(probs[token_id])
-        upper_prob = lower_prob + token_prob
-
-        low = int(coder_L + math.floor(coder_R * lower_prob))
-        high = int(coder_L + math.floor(coder_R * upper_prob) - 1)
-        return lower_prob, upper_prob, low, high
-
-    @staticmethod
-    def _interval_bounds_from_counts(
-        counts: np.ndarray,
-        token_id: int,
-        coder_L: int,
-        coder_R: int,
-    ):
-        token_id = int(token_id)
-        total = int(np.sum(counts))
-        lower_count = int(np.sum(counts[:token_id]))
-        symbol_count = int(counts[token_id])
-        upper_count = lower_count + symbol_count
-
-        lower_prob = (lower_count / total) if total > 0 else 0.0
-        upper_prob = (upper_count / total) if total > 0 else 0.0
-
-        low = int(coder_L + (coder_R * lower_count) // total) if total > 0 else coder_L
-        high = int(coder_L + (coder_R * upper_count) // total - 1) if total > 0 else (coder_L - 1)
-        return lower_prob, upper_prob, low, high, symbol_count, total
-
-    def _write_token_diagnostic(
-        self,
-        writer,
-        phase: str,
-        step_idx: int,
-        token_id: int,
-        raw_probs: np.ndarray,
-        effective_probs: np.ndarray,
-        counts,
-        coder_L_before: int,
-        coder_R_before: int,
-        coder_D_before: Optional[int] = None,
-    ):
-        if writer is None:
-            return
-
-        token_id = int(token_id)
-        counts_np = np.asarray(counts, dtype=np.int64)
-
-        raw_lower, raw_upper, raw_low, raw_high = self._interval_bounds_from_probs(
-            raw_probs,
-            token_id,
-            coder_L_before,
-            coder_R_before,
-        )
-        eff_lower, eff_upper, eff_low, eff_high, symbol_count, counts_total = self._interval_bounds_from_counts(
-            counts_np,
-            token_id,
-            coder_L_before,
-            coder_R_before,
-        )
-
-        prev_token_id = token_id - 1 if token_id > 0 else None
-        next_token_id = token_id + 1 if token_id < (len(raw_probs) - 1) else None
-
-        def _neighbor_bounds(neighbor_id: Optional[int]):
-            if neighbor_id is None:
-                return None
-            n_raw_lower, n_raw_upper, n_raw_low, n_raw_high = self._interval_bounds_from_probs(
-                raw_probs,
-                neighbor_id,
-                coder_L_before,
-                coder_R_before,
-            )
-            n_eff_lower, n_eff_upper, n_eff_low, n_eff_high, _, _ = self._interval_bounds_from_counts(
-                counts_np,
-                neighbor_id,
-                coder_L_before,
-                coder_R_before,
-            )
-            return {
-                "token_id": neighbor_id,
-                "token_text": self._token_text_for_diag(self.tokenizer, neighbor_id),
-                "raw_lower": n_raw_lower,
-                "raw_upper": n_raw_upper,
-                "eff_lower": n_eff_lower,
-                "eff_upper": n_eff_upper,
-                "raw_low": n_raw_low,
-                "raw_high": n_raw_high,
-                "eff_low": n_eff_low,
-                "eff_high": n_eff_high,
-            }
-
-        prev_bounds = _neighbor_bounds(prev_token_id)
-        next_bounds = _neighbor_bounds(next_token_id)
-
-        raw_gap_prev_to_current = ""
-        raw_gap_current_to_next = ""
-        eff_gap_prev_to_current = ""
-        eff_gap_current_to_next = ""
-        raw_interval_gap_prev_to_current = ""
-        raw_interval_gap_current_to_next = ""
-        eff_interval_gap_prev_to_current = ""
-        eff_interval_gap_current_to_next = ""
-
-        if prev_bounds is not None:
-            raw_gap_prev_to_current = raw_lower - prev_bounds["raw_upper"]
-            eff_gap_prev_to_current = eff_lower - prev_bounds["eff_upper"]
-            raw_interval_gap_prev_to_current = raw_low - (prev_bounds["raw_high"] + 1)
-            eff_interval_gap_prev_to_current = eff_low - (prev_bounds["eff_high"] + 1)
-
-        if next_bounds is not None:
-            raw_gap_current_to_next = next_bounds["raw_lower"] - raw_upper
-            eff_gap_current_to_next = next_bounds["eff_lower"] - eff_upper
-            raw_interval_gap_current_to_next = next_bounds["raw_low"] - (raw_high + 1)
-            eff_interval_gap_current_to_next = next_bounds["eff_low"] - (eff_high + 1)
-
-        contains_d = ""
-        if coder_D_before is not None:
-            contains_d = int(eff_low <= int(coder_D_before) <= eff_high)
-
-        top1_raw = int(np.argmax(raw_probs))
-        top1_eff = int(np.argmax(effective_probs))
-
-        writer.writerow(
-            {
-                "phase": phase,
-                "step_idx": int(step_idx),
-                "token_id": token_id,
-                "token_text": self._token_text_for_diag(self.tokenizer, token_id),
-                "coder_D_before": "" if coder_D_before is None else int(coder_D_before),
-                "selected_interval_contains_D": contains_d,
-                # CDF value at selected token (inclusive upper bound).
-                "raw_cum_prob": raw_upper,
-                "effective_cum_prob": eff_upper,
-                "raw_lower_prob": raw_lower,
-                "raw_upper_prob": raw_upper,
-                "effective_lower_prob": eff_lower,
-                "effective_upper_prob": eff_upper,
-                "prev_token_id": "" if prev_bounds is None else int(prev_bounds["token_id"]),
-                "prev_token_text": "" if prev_bounds is None else prev_bounds["token_text"],
-                "raw_prev_lower_prob": "" if prev_bounds is None else prev_bounds["raw_lower"],
-                "raw_prev_upper_prob": "" if prev_bounds is None else prev_bounds["raw_upper"],
-                "effective_prev_lower_prob": "" if prev_bounds is None else prev_bounds["eff_lower"],
-                "effective_prev_upper_prob": "" if prev_bounds is None else prev_bounds["eff_upper"],
-                "raw_prev_interval_low": "" if prev_bounds is None else prev_bounds["raw_low"],
-                "raw_prev_interval_high": "" if prev_bounds is None else prev_bounds["raw_high"],
-                "effective_prev_interval_low": "" if prev_bounds is None else prev_bounds["eff_low"],
-                "effective_prev_interval_high": "" if prev_bounds is None else prev_bounds["eff_high"],
-                "next_token_id": "" if next_bounds is None else int(next_bounds["token_id"]),
-                "next_token_text": "" if next_bounds is None else next_bounds["token_text"],
-                "raw_next_lower_prob": "" if next_bounds is None else next_bounds["raw_lower"],
-                "raw_next_upper_prob": "" if next_bounds is None else next_bounds["raw_upper"],
-                "effective_next_lower_prob": "" if next_bounds is None else next_bounds["eff_lower"],
-                "effective_next_upper_prob": "" if next_bounds is None else next_bounds["eff_upper"],
-                "raw_next_interval_low": "" if next_bounds is None else next_bounds["raw_low"],
-                "raw_next_interval_high": "" if next_bounds is None else next_bounds["raw_high"],
-                "effective_next_interval_low": "" if next_bounds is None else next_bounds["eff_low"],
-                "effective_next_interval_high": "" if next_bounds is None else next_bounds["eff_high"],
-                "raw_gap_prev_to_current": raw_gap_prev_to_current,
-                "raw_gap_current_to_next": raw_gap_current_to_next,
-                "effective_gap_prev_to_current": eff_gap_prev_to_current,
-                "effective_gap_current_to_next": eff_gap_current_to_next,
-                "raw_interval_gap_prev_to_current": raw_interval_gap_prev_to_current,
-                "raw_interval_gap_current_to_next": raw_interval_gap_current_to_next,
-                "effective_interval_gap_prev_to_current": eff_interval_gap_prev_to_current,
-                "effective_interval_gap_current_to_next": eff_interval_gap_current_to_next,
-                "raw_interval_low": raw_low,
-                "raw_interval_high": raw_high,
-                "effective_interval_low": eff_low,
-                "effective_interval_high": eff_high,
-                "coder_L_before": int(coder_L_before),
-                "coder_R_before": int(coder_R_before),
-                "rank_raw": self._rank_from_probs(raw_probs, token_id),
-                "rank_effective": self._rank_from_probs(effective_probs, token_id),
-                "top1_raw_token_id": top1_raw,
-                "top1_raw_prob": float(raw_probs[top1_raw]),
-                "top1_effective_token_id": top1_eff,
-                "top1_effective_prob": float(effective_probs[top1_eff]),
-                "symbol_count": symbol_count,
-                "counts_total": counts_total,
-            }
-        )
-
-    def _configure_determinism_runtime(self):
-        self._batch_invariant_enabled = False
-        self._batch_invariant_ctx = lambda _enabled=True: nullcontext()
-        self._log_softmax_fn = torch.log_softmax
-
-        if self._determinism_mode is None:
-            return
-
-        # CPU path: mimic batch-invariant fixed-order reductions for probability extraction.
-        if self.device.type == "cpu":
-            self._batch_invariant_enabled = True
-            self._batch_invariant_ctx = lambda _enabled=True: nullcontext()
-            self._log_softmax_fn = _cpu_batch_invariant_log_softmax
-            
-            try:
-                import sys
-                from pathlib import Path
-                cpu_ops_path = str(Path(__file__).resolve().parent / "cpu_batch_invariant_ops")
-                if cpu_ops_path not in sys.path:
-                    sys.path.append(cpu_ops_path)
-                from patch_cpu_determinism import patch_llama_for_cpu_determinism
-                patch_llama_for_cpu_determinism()
-            except Exception as e:
-                print(f"Warning: Failed to initialize CPU deep deterministic patch: {e}")
-                
-            return
-
-        if self._determinism_mode == "tbik":
-            if self.device.type != "cuda":
-                self._batch_invariant_enabled = True
-                self._batch_invariant_ctx = lambda _enabled=True: nullcontext()
-                self._log_softmax_fn = _cpu_batch_invariant_log_softmax
-                
-                try:
-                    import sys
-                    from pathlib import Path
-                    cpu_ops_path = str(Path(__file__).resolve().parent / "cpu_batch_invariant_ops")
-                    if cpu_ops_path not in sys.path:
-                        sys.path.append(cpu_ops_path)
-                    from patch_cpu_determinism import patch_llama_for_cpu_determinism
-                    patch_llama_for_cpu_determinism()
-                except Exception as e:
-                    print(f"Warning: Failed to initialize CPU deep deterministic patch: {e}")
-                    
-                return
-            _apply_tbik_patches()
-
-        prefer_repo_backend = self._determinism_mode == "tbik"
-        set_batch_invariant_mode, log_softmax = _import_batch_invariant_backend(
-            prefer_repo_backend=prefer_repo_backend
-        )
-        if set_batch_invariant_mode is None or log_softmax is None:
-            raise RuntimeError(
-                f"determinism_mode='{self._determinism_mode}' requires batch invariant ops, but no backend could be imported"
-            )
-
-        try:
-            sample = torch.zeros((1, 4), dtype=torch.float32, device=self.device)
-            with set_batch_invariant_mode(True):
-                _ = log_softmax(sample, dim=-1)
-            self._batch_invariant_enabled = True
-            self._batch_invariant_ctx = set_batch_invariant_mode
-            self._log_softmax_fn = log_softmax
-        except Exception as exc:
-            raise RuntimeError(
-                f"Failed to initialize determinism_mode='{self._determinism_mode}' backend: {exc}"
-            ) from exc
 
     def _invariant_context(self):
         if self._batch_invariant_enabled:
@@ -1113,183 +459,6 @@ class DeterministicLLMCodec:
             return probs_to_counts_legacy(probs, self.config.slots, self.dec_prec)
         return probs_to_counts(probs, self.config.slots, self.dec_prec)
 
-    @staticmethod
-    def _write_csv_rows(path: str, rows: List[Dict[str, Any]]):
-        if not rows:
-            return
-        out_path = Path(path)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with out_path.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(rows)
-
-    def _start_memory_monitor(self, enabled: bool, sample_interval: float):
-        if not enabled:
-            return None
-
-        try:
-            import psutil
-        except Exception:
-            return None
-
-        stop_event = threading.Event()
-        rows: List[Dict[str, float]] = []
-        process = psutil.Process(os.getpid())
-        start_time = time.perf_counter()
-        has_cuda = torch.cuda.is_available()
-        has_mps = bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
-
-        mps_alloc_fn = None
-        if has_mps and hasattr(torch, "mps"):
-            mps_alloc_fn = getattr(torch.mps, "current_allocated_memory", None)
-
-        def _monitor():
-            while not stop_event.is_set():
-                try:
-                    mem_info = process.memory_info()
-                    cuda_allocated_mb = ""
-                    cuda_reserved_mb = ""
-                    mps_allocated_mb = ""
-                    vram_mb = ""
-
-                    if has_cuda:
-                        try:
-                            cuda_allocated_mb = float(torch.cuda.memory_allocated()) / (1024.0 * 1024.0)
-                            cuda_reserved_mb = float(torch.cuda.memory_reserved()) / (1024.0 * 1024.0)
-                            vram_mb = cuda_allocated_mb
-                        except Exception:
-                            pass
-
-                    if has_mps and mps_alloc_fn is not None:
-                        try:
-                            mps_allocated_mb = float(mps_alloc_fn()) / (1024.0 * 1024.0)
-                            if vram_mb == "":
-                                vram_mb = mps_allocated_mb
-                        except Exception:
-                            pass
-
-                    rows.append(
-                        {
-                            "time": time.perf_counter() - start_time,
-                            "rss_mb": float(mem_info.rss) / (1024.0 * 1024.0),
-                            "vms_mb": float(mem_info.vms) / (1024.0 * 1024.0),
-                            "vram_mb": vram_mb,
-                            "cuda_allocated_mb": cuda_allocated_mb,
-                            "cuda_reserved_mb": cuda_reserved_mb,
-                            "mps_allocated_mb": mps_allocated_mb,
-                        }
-                    )
-                except Exception:
-                    break
-                time.sleep(max(0.01, float(sample_interval)))
-
-        thread = threading.Thread(target=_monitor, daemon=True)
-        thread.start()
-        return {"stop_event": stop_event, "thread": thread, "rows": rows}
-
-    def _stop_memory_monitor(self, monitor_state, speed_rows: List[Dict[str, Any]]):
-        if monitor_state is None:
-            return []
-
-        monitor_state["stop_event"].set()
-        monitor_state["thread"].join()
-        rows = monitor_state["rows"]
-        if not rows:
-            return []
-
-        if speed_rows:
-            elapsed = np.cumsum([float(row["time"]) for row in speed_rows])
-            pos = np.asarray([float(row["pos"]) for row in speed_rows], dtype=np.float64)
-            for row in rows:
-                row["aligned_pos"] = float(np.interp(float(row["time"]), elapsed, pos))
-        else:
-            for row in rows:
-                row["aligned_pos"] = ""
-
-        return rows
-
-    def _maybe_write_divergence_rows(
-        self,
-        demo_csv_path: str,
-        decoded_ids: Sequence[int],
-        reference_token_ids: Optional[Sequence[int]],
-        divergence_window: int,
-    ):
-        if reference_token_ids is None:
-            return
-
-        reference_ids = [int(x) for x in reference_token_ids]
-        decoded = [int(x) for x in decoded_ids]
-        compare_len = min(len(decoded), len(reference_ids))
-
-        first_div_idx = None
-        for idx in range(compare_len):
-            if decoded[idx] != reference_ids[idx]:
-                first_div_idx = idx
-                break
-
-        if first_div_idx is None and len(decoded) != len(reference_ids):
-            first_div_idx = compare_len
-
-        rows: List[Dict[str, Any]] = []
-        if first_div_idx is None:
-            rows.append(
-                {
-                    "segment": "summary",
-                    "step_idx": "",
-                    "reference_token_id": "",
-                    "reference_token_text": "",
-                    "decoded_token_id": "",
-                    "decoded_token_text": "",
-                    "match": 1,
-                    "note": "No divergence detected in compared token sequence.",
-                }
-            )
-        else:
-            start_match = max(0, first_div_idx - int(max(1, divergence_window)))
-            for idx in range(start_match, first_div_idx):
-                ref_id = reference_ids[idx]
-                dec_id = decoded[idx]
-                rows.append(
-                    {
-                        "segment": "last_matching",
-                        "step_idx": idx,
-                        "reference_token_id": ref_id,
-                        "reference_token_text": self._token_text_for_diag(self.tokenizer, ref_id),
-                        "decoded_token_id": dec_id,
-                        "decoded_token_text": self._token_text_for_diag(self.tokenizer, dec_id),
-                        "match": int(ref_id == dec_id),
-                        "note": "",
-                    }
-                )
-
-            max_len = max(len(decoded), len(reference_ids))
-            end_div = min(max_len, first_div_idx + int(max(1, divergence_window)))
-            for idx in range(first_div_idx, end_div):
-                ref_id = reference_ids[idx] if idx < len(reference_ids) else None
-                dec_id = decoded[idx] if idx < len(decoded) else None
-                rows.append(
-                    {
-                        "segment": "first_diverged",
-                        "step_idx": idx,
-                        "reference_token_id": "" if ref_id is None else ref_id,
-                        "reference_token_text": ""
-                        if ref_id is None
-                        else self._token_text_for_diag(self.tokenizer, ref_id),
-                        "decoded_token_id": "" if dec_id is None else dec_id,
-                        "decoded_token_text": ""
-                        if dec_id is None
-                        else self._token_text_for_diag(self.tokenizer, dec_id),
-                        "match": int(ref_id is not None and dec_id is not None and ref_id == dec_id),
-                        "note": "",
-                    }
-                )
-
-        divergence_path = Path(demo_csv_path)
-        divergence_path = divergence_path.with_name(f"{divergence_path.stem}_divergence.csv")
-        self._write_csv_rows(str(divergence_path), rows)
-
     def encode(
         self,
         text: str,
@@ -1309,16 +478,16 @@ class DeterministicLLMCodec:
             token_ids = token_ids + [self.eof_token_id]
 
         writer = BitWriter()
-        enc = Encoder(Coder(b=self.config.precision), writer)
+        enc = Encoder(writer, b=self.config.precision)
         iterator = enumerate(token_ids)
         if show_progress:
             iterator = tqdm(iterator, total=len(token_ids), desc="Deterministic Encode")
 
         cache_state = self._init_cache_state()
-        diag_handle, diag_writer = self._open_diagnostics_writer("encode")
+        diag_handle, diag_writer = self._diag_writer.open_writer("encode")
         demo_rows: List[Dict[str, Any]] = []
         speed_rows: List[Dict[str, Any]] = []
-        monitor_state = self._start_memory_monitor(memory_demo, memory_sample_interval)
+        monitor_state = start_memory_monitor(memory_demo, memory_sample_interval)
 
         try:
             with self._invariant_context():
@@ -1347,7 +516,7 @@ class DeterministicLLMCodec:
                             {
                                 "pos": int(idx),
                                 "token_id": int(token_id),
-                                "token": self._token_text_for_diag(self.tokenizer, int(token_id)),
+                                "token": token_text_for_diag(self.tokenizer, int(token_id)),
                                 "prob_raw": p_raw,
                                 "prob_effective": p_eff,
                                 "perplexity_raw": 1.0 / safe_raw,
@@ -1355,9 +524,9 @@ class DeterministicLLMCodec:
                             }
                         )
 
-                    coder_L_before = int(enc.coder.L)
-                    coder_R_before = int(enc.coder.R)
-                    self._write_token_diagnostic(
+                    coder_L_before = int(enc.L)
+                    coder_R_before = int(enc.R)
+                    self._diag_writer.write_token_diagnostic(
                         diag_writer,
                         phase="encode",
                         step_idx=idx,
@@ -1387,17 +556,17 @@ class DeterministicLLMCodec:
             if diag_handle is not None:
                 diag_handle.close()
             if memory_demo:
-                memory_rows = self._stop_memory_monitor(monitor_state, speed_rows)
-                self._write_csv_rows(memory_csv_path, memory_rows)
+                memory_rows = stop_memory_monitor(monitor_state, speed_rows)
+                write_csv_rows(memory_csv_path, memory_rows)
 
         enc.finish()
         writer.flush()
         encoded_bytes = writer.getvalue()
 
         if speed_demo:
-            self._write_csv_rows(speed_csv_path, speed_rows)
+            write_csv_rows(speed_csv_path, speed_rows)
         if demo:
-            self._write_csv_rows(demo_csv_path, demo_rows)
+            write_csv_rows(demo_csv_path, demo_rows)
 
         if safe_mode or return_token_count:
             return encoded_bytes, len(token_ids)
@@ -1420,13 +589,13 @@ class DeterministicLLMCodec:
         reference_token_ids: Optional[Sequence[int]] = None,
         divergence_window: int = 5,
     ) -> str:
-        dec = Decoder(Coder(b=self.config.precision), BitReader(encoded_bytes))
+        dec = Decoder(BitReader(encoded_bytes), b=self.config.precision)
         decoded_ids = []
         cache_state = self._init_cache_state()
-        diag_handle, diag_writer = self._open_diagnostics_writer("decode")
+        diag_handle, diag_writer = self._diag_writer.open_writer("decode")
         demo_rows: List[Dict[str, Any]] = []
         speed_rows: List[Dict[str, Any]] = []
-        monitor_state = self._start_memory_monitor(memory_demo, memory_sample_interval)
+        monitor_state = start_memory_monitor(memory_demo, memory_sample_interval)
         decoded_text = ""
 
         if safe_mode and expected_num_tokens is None:
@@ -1463,12 +632,12 @@ class DeterministicLLMCodec:
                         raw_probs, probs = self._raw_and_effective_probs(logits)
                         counts = self._counts_from_probs(probs)
 
-                        coder_L_before = int(dec.coder.L)
-                        coder_R_before = int(dec.coder.R)
-                        coder_D_before = int(dec.coder.D)
+                        coder_L_before = int(dec.L)
+                        coder_R_before = int(dec.R)
+                        coder_D_before = int(dec.D)
                         token_id = dec.decode_symbol(counts_to_cum_desc(counts))
 
-                        self._write_token_diagnostic(
+                        self._diag_writer.write_token_diagnostic(
                             diag_writer,
                             phase="decode",
                             step_idx=idx,
@@ -1488,7 +657,7 @@ class DeterministicLLMCodec:
                             row: Dict[str, Any] = {
                                 "pos": int(idx),
                                 "decoded_token_id": int(token_id),
-                                "decoded_token": self._token_text_for_diag(self.tokenizer, int(token_id)),
+                                "decoded_token": token_text_for_diag(self.tokenizer, int(token_id)),
                                 "prob_raw": p_raw,
                                 "prob_effective": p_eff,
                                 "perplexity_raw": 1.0 / safe_raw,
@@ -1497,7 +666,7 @@ class DeterministicLLMCodec:
                             if reference_token_ids is not None and idx < len(reference_token_ids):
                                 ref_id = int(reference_token_ids[idx])
                                 row["reference_token_id"] = ref_id
-                                row["reference_token"] = self._token_text_for_diag(self.tokenizer, ref_id)
+                                row["reference_token"] = token_text_for_diag(self.tokenizer, ref_id)
                                 row["match"] = int(ref_id == int(token_id))
                             demo_rows.append(row)
 
@@ -1539,12 +708,12 @@ class DeterministicLLMCodec:
                         raw_probs, probs = self._raw_and_effective_probs(logits)
                         counts = self._counts_from_probs(probs)
 
-                        coder_L_before = int(dec.coder.L)
-                        coder_R_before = int(dec.coder.R)
-                        coder_D_before = int(dec.coder.D)
+                        coder_L_before = int(dec.L)
+                        coder_R_before = int(dec.R)
+                        coder_D_before = int(dec.D)
                         token_id = dec.decode_symbol(counts_to_cum_desc(counts))
 
-                        self._write_token_diagnostic(
+                        self._diag_writer.write_token_diagnostic(
                             diag_writer,
                             phase="decode",
                             step_idx=idx,
@@ -1564,7 +733,7 @@ class DeterministicLLMCodec:
                             row = {
                                 "pos": int(idx),
                                 "decoded_token_id": int(token_id),
-                                "decoded_token": self._token_text_for_diag(self.tokenizer, int(token_id)),
+                                "decoded_token": token_text_for_diag(self.tokenizer, int(token_id)),
                                 "prob_raw": p_raw,
                                 "prob_effective": p_eff,
                                 "perplexity_raw": 1.0 / safe_raw,
@@ -1573,7 +742,7 @@ class DeterministicLLMCodec:
                             if reference_token_ids is not None and idx < len(reference_token_ids):
                                 ref_id = int(reference_token_ids[idx])
                                 row["reference_token_id"] = ref_id
-                                row["reference_token"] = self._token_text_for_diag(self.tokenizer, ref_id)
+                                row["reference_token"] = token_text_for_diag(self.tokenizer, ref_id)
                                 row["match"] = int(ref_id == int(token_id))
                             demo_rows.append(row)
 
@@ -1601,14 +770,15 @@ class DeterministicLLMCodec:
             if diag_handle is not None:
                 diag_handle.close()
             if memory_demo:
-                memory_rows = self._stop_memory_monitor(monitor_state, speed_rows)
-                self._write_csv_rows(memory_csv_path, memory_rows)
+                memory_rows = stop_memory_monitor(monitor_state, speed_rows)
+                write_csv_rows(memory_csv_path, memory_rows)
 
         if speed_demo:
-            self._write_csv_rows(speed_csv_path, speed_rows)
+            write_csv_rows(speed_csv_path, speed_rows)
         if demo:
-            self._write_csv_rows(demo_csv_path, demo_rows)
-            self._maybe_write_divergence_rows(
+            write_csv_rows(demo_csv_path, demo_rows)
+            maybe_write_divergence_rows(
+                self.tokenizer,
                 demo_csv_path=demo_csv_path,
                 decoded_ids=decoded_ids,
                 reference_token_ids=reference_token_ids,

@@ -187,7 +187,7 @@ class DriftAwareLLMCodec:
             token_ids = token_ids + [self.eof_token_id]
 
         writer = BitWriter()
-        enc = Encoder(Coder(b=self.config.precision), writer)
+        enc = Encoder(writer, b=self.config.precision)
 
         cache_state = self.base._init_cache_state()
         reference_rows: List[Dict[str, Any]] = []
@@ -214,8 +214,8 @@ class DriftAwareLLMCodec:
                 counts = self.base._counts_from_probs(effective_probs)
                 cum_desc = counts_to_cum_desc(counts)
 
-                coder_L_before = int(enc.coder.L)
-                coder_R_before = int(enc.coder.R)
+                coder_L_before = int(enc.L)
+                coder_R_before = int(enc.R)
                 _, _, enc_low, enc_high, symbol_count, counts_total = self.base._interval_bounds_from_counts(
                     counts,
                     token_id,
@@ -292,7 +292,7 @@ class DriftAwareLLMCodec:
         expected_num_tokens: Optional[int] = None,
         show_progress: bool = True,
     ):
-        dec = Decoder(Coder(b=self.config.precision), BitReader(encoded_bytes))
+        dec = Decoder(BitReader(encoded_bytes), b=self.config.precision)
         decoded_ids: List[int] = []
         drift_rows: List[Dict[str, Any]] = []
         cache_state = self.base._init_cache_state()
@@ -382,8 +382,8 @@ class DriftAwareLLMCodec:
                     counts = self.base._counts_from_probs(effective_probs)
                     cum_desc = counts_to_cum_desc(counts)
 
-                    coder_D_before = int(dec.coder.D)
-                    predicted_token, pred_low, pred_high = self._select_symbol_and_interval(cum_desc, dec.coder)
+                    coder_D_before = int(dec.D)
+                    predicted_token, pred_low, pred_high = self._select_symbol_and_interval(cum_desc, dec)
 
                     ref_token = None
                     ref_low = None
@@ -400,10 +400,10 @@ class DriftAwareLLMCodec:
                     )
 
                     if use_reference:
-                        dec.coder.set_interval_and_renorm_decode(int(ref_low), int(ref_high))
+                        dec.set_interval_and_renorm_decode(int(ref_low), int(ref_high))
                         applied_token = int(ref_token)
                     else:
-                        dec.coder.set_interval_and_renorm_decode(int(pred_low), int(pred_high))
+                        dec.set_interval_and_renorm_decode(int(pred_low), int(pred_high))
                         applied_token = int(predicted_token)
 
                     _append_drift_row(
@@ -452,8 +452,8 @@ class DriftAwareLLMCodec:
                     counts = self.base._counts_from_probs(effective_probs)
                     cum_desc = counts_to_cum_desc(counts)
 
-                    coder_D_before = int(dec.coder.D)
-                    predicted_token, pred_low, pred_high = self._select_symbol_and_interval(cum_desc, dec.coder)
+                    coder_D_before = int(dec.D)
+                    predicted_token, pred_low, pred_high = self._select_symbol_and_interval(cum_desc, dec)
 
                     ref_token = None
                     ref_low = None
@@ -470,10 +470,10 @@ class DriftAwareLLMCodec:
                     )
 
                     if use_reference:
-                        dec.coder.set_interval_and_renorm_decode(int(ref_low), int(ref_high))
+                        dec.set_interval_and_renorm_decode(int(ref_low), int(ref_high))
                         applied_token = int(ref_token)
                     else:
-                        dec.coder.set_interval_and_renorm_decode(int(pred_low), int(pred_high))
+                        dec.set_interval_and_renorm_decode(int(pred_low), int(pred_high))
                         applied_token = int(predicted_token)
 
                     _append_drift_row(

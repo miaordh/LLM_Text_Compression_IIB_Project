@@ -246,8 +246,7 @@ class LLM_Encoder(LLM_Codec_Base, _KVCacheMixin):
         token_ids.append(self.eof_token_id)
         
         bit_writer = BitWriter()
-        coder = Coder(b=self.precision)
-        enc = Encoder(coder, bit_writer)
+        enc = Encoder(bit_writer, b=self.precision)
         
         cache_state = self._init_cache_state()
         speed_rows = []
@@ -317,8 +316,7 @@ class LLM_Encoder(LLM_Codec_Base, _KVCacheMixin):
 class LLM_Decoder(LLM_Codec_Base, _KVCacheMixin):
     def decode(self, encoded_bytes, speed_demo=False, speed_csv_path="speed_decode.csv"):
         bit_reader = BitReader(encoded_bytes)
-        coder = Coder(b=self.precision)
-        dec = Decoder(coder, bit_reader)
+        dec = Decoder(bit_reader, b=self.precision)
         
         decoded_ids = []
         cache_state = self._init_cache_state()

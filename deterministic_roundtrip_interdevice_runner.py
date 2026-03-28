@@ -96,6 +96,37 @@ DECODE_CONFIG_PATH = Path("results/roundtrip/deterministic_roundtrip_decode_conf
 ARTIFACT_ROOT_BASE = Path(".roundtrip_artifacts")
 ENCODE_ATTEMPT_MARKER = "__ROUNDTRIP_ENCODE_ATTEMPT__"
 
+ENCODE_RESULT_COLUMNS = [
+    "file",
+    "status",
+    "input_size_bytes",
+    "safe_mode",
+    "num_tokens",
+    "encoded_size_bytes",
+    "compression_ratio",
+    "encode_seconds",
+    "fallback_attempted",
+    "attempt_count",
+    "error",
+]
+
+DECODE_RESULT_COLUMNS = [
+    "file",
+    "status",
+    "input_size_bytes",
+    "safe_mode",
+    "num_tokens",
+    "encoded_size_bytes",
+    "compression_ratio",
+    "encode_seconds",
+    "decode_seconds",
+    "original_chars",
+    "decoded_chars",
+    "fallback_attempted",
+    "attempt_count",
+    "error",
+]
+
 
 def _with_tag(path: Path, tag: str) -> Path:
     return path.with_name(f"{path.stem}_{tag}{path.suffix}")
@@ -338,6 +369,7 @@ def _run_encode_phase(project_root: Path, worker: Path, run_tag: str):
                 {
                     "file": str(file_path),
                     "status": "encode_failed",
+                    "num_tokens": None,
                     "error": _sanitize_error_text(err or "Encode phase failed"),
                     "fallback_attempted": fallback_attempted,
                     "attempt_count": attempt_count,
@@ -366,7 +398,7 @@ def _run_encode_phase(project_root: Path, worker: Path, run_tag: str):
             }
         )
 
-    pd.DataFrame(rows).to_csv(output_csv_path, index=False)
+    pd.DataFrame(rows).reindex(columns=ENCODE_RESULT_COLUMNS).to_csv(output_csv_path, index=False)
 
     print(f"Run tag: {run_tag}")
     print(f"Encode config written to: {config_path}")
@@ -424,6 +456,7 @@ def _run_decode_phase(project_root: Path, worker: Path, run_tag: str):
                 {
                     "file": str(file_path),
                     "status": "decode_failed",
+                    "num_tokens": None,
                     "error": f"Missing artifact directory: {job_dir}",
                     "fallback_attempted": False,
                     "attempt_count": 0,
@@ -457,6 +490,7 @@ def _run_decode_phase(project_root: Path, worker: Path, run_tag: str):
                 {
                     "file": str(file_path),
                     "status": "decode_failed",
+                    "num_tokens": None,
                     "error": _sanitize_error_text(err or "Decode phase failed"),
                     "fallback_attempted": fallback_attempted,
                     "attempt_count": attempt_count,
@@ -495,7 +529,7 @@ def _run_decode_phase(project_root: Path, worker: Path, run_tag: str):
             }
         )
 
-    pd.DataFrame(rows).to_csv(decode_csv_path, index=False)
+    pd.DataFrame(rows).reindex(columns=DECODE_RESULT_COLUMNS).to_csv(decode_csv_path, index=False)
 
     print(f"Run tag: {run_tag}")
     print(f"Decode config used: {decode_config_path}")

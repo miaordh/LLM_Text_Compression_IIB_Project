@@ -25,6 +25,24 @@ if os.environ.get("TRANSFORMERS_CACHE") and not os.environ.get("HF_HOME"):
 ARTIFACT_ROOT = Path(".roundtrip_artifacts")
 ENCODE_ATTEMPT_MARKER = "__ROUNDTRIP_ENCODE_ATTEMPT__"
 
+ROUNDTRIP_RESULT_COLUMNS = [
+    "file",
+    "status",
+    "inference_backend",
+    "input_size_bytes",
+    "safe_mode",
+    "num_tokens",
+    "encoded_size_bytes",
+    "compression_ratio",
+    "encode_seconds",
+    "decode_seconds",
+    "original_chars",
+    "decoded_chars",
+    "fallback_attempted",
+    "attempt_count",
+    "error",
+]
+
 
 def _read_text(path: Path, encoding: str) -> str:
     return path.read_text(encoding=encoding, errors="replace")
@@ -317,7 +335,7 @@ def _phase_encode(config: Dict[str, Any], file_path: Path, artifact_dir: Path):
             encoded_result = codec.encode(
                 text,
                 safe_mode=safe_mode,
-                return_token_count=safe_mode,
+                return_token_count=True,
                 show_progress=False,
                 demo=demo_mode,
                 demo_csv_path=str(artifact_dir / "demo_encode.csv"),
@@ -329,7 +347,7 @@ def _phase_encode(config: Dict[str, Any], file_path: Path, artifact_dir: Path):
             )
             encode_seconds = time.time() - start
 
-            if safe_mode:
+            if isinstance(encoded_result, tuple):
                 encoded_bytes, num_tokens = encoded_result
             else:
                 encoded_bytes = encoded_result
@@ -557,6 +575,7 @@ def _run_orchestrator(config_path: Path):
                     {
                         "file": str(file_path),
                         "status": "skipped",
+                        "num_tokens": None,
                         "error": "File does not exist or is not a file",
                         "fallback_attempted": False,
                         "attempt_count": 0,
@@ -587,6 +606,7 @@ def _run_orchestrator(config_path: Path):
                     {
                         "file": str(file_path),
                         "status": "encode_failed",
+                        "num_tokens": None,
                         "error": _sanitize_error_text(err_enc or "Encode phase failed"),
                         "fallback_attempted": fallback_attempted,
                         "attempt_count": attempt_count,
@@ -622,6 +642,7 @@ def _run_orchestrator(config_path: Path):
                     {
                         "file": str(file_path),
                         "status": "decode_failed",
+                        "num_tokens": None,
                         "error": _sanitize_error_text(err_dec or "Decode phase failed"),
                         "fallback_attempted": fallback_attempted,
                         "attempt_count": attempt_count,
@@ -682,7 +703,7 @@ def _run_orchestrator(config_path: Path):
             file=sys.stderr,
         )
 
-    pd.DataFrame(rows).to_csv(output_csv, index=False)
+    pd.DataFrame(rows).reindex(columns=ROUNDTRIP_RESULT_COLUMNS).to_csv(output_csv, index=False)
 
 
 if __name__ == "__main__":

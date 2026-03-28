@@ -11,7 +11,7 @@ from typing import List
 # ---------------------------
 # Runner settings (edit me)
 # ---------------------------
-MODEL_ID = "openai-community/gpt2"
+MODEL_ID = "deepseek-ai/deepseek-coder-1.3b-base"
 REVISION = None
 TRUST_REMOTE_CODE = False
 TORCH_DTYPE = "float32"  # auto | float32 | float16 | bfloat16
@@ -28,10 +28,10 @@ OOM_FALLBACK_STRATEGY = "block"  # rolling | block | no_kv_cache
 OOM_FALLBACK_CONTEXT_WINDOW = 16
 OOM_FALLBACK_MARGIN = 2
 
-SAFE_MODE = True
+SAFE_MODE = False
 PRECISION = 32
 SLOTS = 1 << 24
-CONTEXT_WINDOW = 128
+CONTEXT_WINDOW = 300
 MARGIN = 16
 STRATEGY = "rolling"  # rolling | block | no_kv_cache
 USE_LEGACY_COUNTS = False
@@ -40,8 +40,8 @@ LOGIT_ROUND_DECIMALS = 15
 PROB_ROUND_DECIMALS = 1
 # None | batch_invariant_ops | tbik
 # In cross_device mode, worker encodes on CPU and decodes on accelerator.
-DETERMINISM_MODE = "tbik"
-INFERENCE_BACKEND = "auto"  # auto | huggingface | vllm
+DETERMINISM_MODE = None
+INFERENCE_BACKEND = "huggingface"  # auto | huggingface | vllm
 VLLM_TENSOR_PARALLEL_SIZE = 1
 VLLM_GPU_MEMORY_UTILIZATION = 0.9
 # None -> use tokenizer vocab size as max_logprobs for full-distribution reconstruction.
@@ -49,7 +49,7 @@ VLLM_MAX_LOGPROBS = None
 # None -> codec defaults to context_window for safer KV cache sizing.
 VLLM_MAX_MODEL_LEN = None
 MAX_DECODE_TOKENS = None
-DIAGNOSTICS_ENABLED = True
+DIAGNOSTICS_ENABLED = False
 # Optional diagnostics CSV prefix. If None and diagnostics is enabled, worker writes
 # per-file CSVs under that file's artifact directory.
 DIAGNOSTICS_CSV_PREFIX = None
@@ -69,7 +69,7 @@ FILE_ENCODING_OVERRIDES = {
     "cp.html": "windows-1252",
 }
 
-KEEP_ARTIFACTS = False
+KEEP_ARTIFACTS = True
 PHASE_TIMEOUT_SECONDS = 18000 # 0 disables timeout
 # Per-file behavior: when True, a file stops immediately on encode/decode error,
 # but the run still continues with remaining files.
@@ -99,7 +99,7 @@ CURRENT_FOLDER_TEXT_SELECTION = None
 # - None: run nothing from MY_CORPUS_DIR
 # - "all": run every .txt file under MY_CORPUS_DIR
 # - list[str]: explicit filenames relative to MY_CORPUS_DIR
-MY_CORPUS_FILE_SELECTION = ["Shall I Compare Thee To a Summer's Day.txt", "再别康桥.txt"]
+MY_CORPUS_FILE_SELECTION = ["zaobao_15_jan.txt"]
 
 # File selection for artificial_corpus:
 # - None: run nothing from ARTIFICIAL_CORPUS_DIR
