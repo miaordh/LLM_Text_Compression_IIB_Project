@@ -26,3 +26,6 @@ api_roundtrip_results*.csv
 .api_roundtrip_artifacts/
 results/
 old_results/
+.multillm_roundtrip_artifacts/
+multillm_roundtrip_config*.json
+multillm_roundtrip_results*.csv

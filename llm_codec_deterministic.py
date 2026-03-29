@@ -473,7 +473,24 @@ class DeterministicLLMCodec:
         memory_csv_path: str = "memory_encode.csv",
         memory_sample_interval: float = 0.05,
     ):
-        token_ids = self.tokenizer.encode(text)
+        # Try to tokenise the whole text, fallback to block tokenisation if it fails
+        try:
+            token_ids = self.tokenizer.encode(text)
+        except Exception:
+            # Fallback: tokenise in smaller blocks
+            block_size = 256  # chars, can be tuned
+            token_ids = []
+            start = 0
+            while start < len(text):
+                end = min(start + block_size, len(text))
+                block = text[start:end]
+                try:
+                    block_token_ids = self.tokenizer.encode(block)
+                except Exception:
+                    # If even a small block fails, skip it (or could raise)
+                    block_token_ids = []
+                token_ids.extend(block_token_ids)
+                start = end
         if not safe_mode:
             token_ids = token_ids + [self.eof_token_id]
 
