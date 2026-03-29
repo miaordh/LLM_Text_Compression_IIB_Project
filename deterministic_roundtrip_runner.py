@@ -11,11 +11,11 @@ from typing import List
 # ---------------------------
 # Runner settings (edit me)
 # ---------------------------
-MODEL_ID = "deepseek-ai/deepseek-coder-1.3b-base"
+MODEL_ID = "Qwen/Qwen2.5-0.5B"
 REVISION = None
 TRUST_REMOTE_CODE = False
-TORCH_DTYPE = "float32"  # auto | float32 | float16 | bfloat16
-DEVICE = "cpu"  # auto | cpu | cuda | mps
+TORCH_DTYPE = "auto"  # auto | float32 | float16 | bfloat16
+DEVICE = "cuda"  # auto | cpu | cuda | mps
 DEVICE_MODE = "single_device"  # single_device | cross_device
 
 # Large-file safety knobs (used by worker):
@@ -28,11 +28,11 @@ OOM_FALLBACK_STRATEGY = "block"  # rolling | block | no_kv_cache
 OOM_FALLBACK_CONTEXT_WINDOW = 16
 OOM_FALLBACK_MARGIN = 2
 
-SAFE_MODE = False
+SAFE_MODE = True
 PRECISION = 32
 SLOTS = 1 << 24
-CONTEXT_WINDOW = 300
-MARGIN = 16
+CONTEXT_WINDOW = 1024
+MARGIN = 128
 STRATEGY = "rolling"  # rolling | block | no_kv_cache
 USE_LEGACY_COUNTS = False
 QUANT = False
@@ -56,9 +56,9 @@ DIAGNOSTICS_CSV_PREFIX = None
 
 # Optional demo modes in llm_codec_deterministic.
 # When enabled, worker writes per-file CSVs under each file artifact directory.
-DEMO_MODE = True
-SPEED_DEMO = True
-MEMORY_DEMO = True
+DEMO_MODE = False
+SPEED_DEMO = False
+MEMORY_DEMO = False
 MEMORY_SAMPLE_INTERVAL = 0.05
 DIVERGENCE_WINDOW = 5
 
@@ -70,7 +70,7 @@ FILE_ENCODING_OVERRIDES = {
 }
 
 KEEP_ARTIFACTS = True
-PHASE_TIMEOUT_SECONDS = 18000 # 0 disables timeout
+PHASE_TIMEOUT_SECONDS = 0 # 0 disables timeout
 # Per-file behavior: when True, a file stops immediately on encode/decode error,
 # but the run still continues with remaining files.
 STOP_ON_FILE_ERROR = True
@@ -84,8 +84,8 @@ RUN_TAG = None
 # - None: run nothing from CANTRBRY_DIR
 # - "all": run every file under CANTRBRY_DIR
 # - list[str]: explicit relative filenames under CANTRBRY_DIR
-# CANTRBRY_FILE_SELECTION = ["alice29.txt", "asyoulik.txt", "cp.html", "kennedy.xls", "lcet10.txt", "plrabn12.txt", "ptt5"]
-CANTRBRY_FILE_SELECTION = None
+CANTRBRY_FILE_SELECTION = ["kennedy.xls"]
+# CANTRBRY_FILE_SELECTION = None
 
 # File selection for text files using project-relative paths:
 # - None: run nothing from project-relative selections
@@ -93,13 +93,12 @@ CANTRBRY_FILE_SELECTION = None
 # - list[str]: explicit relative filenames (for example under my_corpus/)
 # CURRENT_FOLDER_TEXT_SELECTION = ["my_corpus/Shall I Compare Thee To a Summer's Day.txt", "my_corpus/再别康桥.txt"]
 CURRENT_FOLDER_TEXT_SELECTION = None
-# CURRENT_FOLDER_TEXT_SELECTION = None
 
 # File selection for my_corpus:
 # - None: run nothing from MY_CORPUS_DIR
 # - "all": run every .txt file under MY_CORPUS_DIR
 # - list[str]: explicit filenames relative to MY_CORPUS_DIR
-MY_CORPUS_FILE_SELECTION = ["zaobao_15_jan.txt"]
+MY_CORPUS_FILE_SELECTION = None
 
 # File selection for artificial_corpus:
 # - None: run nothing from ARTIFICIAL_CORPUS_DIR

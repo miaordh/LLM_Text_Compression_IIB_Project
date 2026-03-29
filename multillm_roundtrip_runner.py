@@ -16,6 +16,11 @@ from typing import List
 # ---------------------------
 MODEL_ID_LIST = [
     "deepseek-ai/deepseek-coder-1.3b-base",
+    "Qwen/Qwen2.5-0.5B",
+    "Qwen/Qwen3-0.6B",
+    "google/gemma-2b",
+    "openai-community/gpt2",
+    "openai-community/gpt2-medium"
     # Add more model IDs here
 ]
 REVISION = None
@@ -38,6 +43,38 @@ CONFIG_PATH = Path("results/multillm_results/multillm_roundtrip_config.json")
 ARTIFACT_ROOT_BASE = Path(".multillm_roundtrip_artifacts")
 
 # Other settings can be added as needed
+# Additional settings from deterministic_roundtrip_runner.py
+IGNORE_MODEL_MAX_LENGTH_WARNING = True
+ENABLE_OOM_FALLBACK = True
+OOM_FALLBACK_STRATEGY = "block"  # rolling | block | no_kv_cache
+OOM_FALLBACK_CONTEXT_WINDOW = 16
+OOM_FALLBACK_MARGIN = 2
+
+SAFE_MODE = True
+PRECISION = 32
+SLOTS = 1 << 24
+CONTEXT_WINDOW = 512
+MARGIN = 32
+STRATEGY = "rolling"  # rolling | block | no_kv_cache
+USE_LEGACY_COUNTS = False
+QUANT = False
+LOGIT_ROUND_DECIMALS = 15
+PROB_ROUND_DECIMALS = 1
+DETERMINISM_MODE = None
+INFERENCE_BACKEND = "huggingface"  # auto | huggingface | vllm
+VLLM_TENSOR_PARALLEL_SIZE = 1
+VLLM_GPU_MEMORY_UTILIZATION = 0.9
+VLLM_MAX_LOGPROBS = None
+VLLM_MAX_MODEL_LEN = None
+MAX_DECODE_TOKENS = None
+DIAGNOSTICS_ENABLED = False
+DIAGNOSTICS_CSV_PREFIX = None
+DEMO_MODE = False
+SPEED_DEMO = False
+MEMORY_DEMO = False
+MEMORY_SAMPLE_INTERVAL = 0.05
+DIVERGENCE_WINDOW = 5
+STOP_ON_FILE_ERROR = True
 
 
 def _resolve_run_tag() -> str:
