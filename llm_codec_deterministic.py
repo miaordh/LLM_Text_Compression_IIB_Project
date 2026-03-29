@@ -477,20 +477,28 @@ class DeterministicLLMCodec:
         try:
             token_ids = self.tokenizer.encode(text)
         except Exception:
-            # Fallback: tokenise in smaller blocks
+            # Fallback: tokenise in smaller blocks, skip empty/invalid blocks, check token ID range
             block_size = 256  # chars, can be tuned
             token_ids = []
             start = 0
+            vocab_size = len(self.tokenizer)
+            skipped_blocks = 0
             while start < len(text):
                 end = min(start + block_size, len(text))
                 block = text[start:end]
                 try:
                     block_token_ids = self.tokenizer.encode(block)
                 except Exception:
-                    # If even a small block fails, skip it (or could raise)
                     block_token_ids = []
-                token_ids.extend(block_token_ids)
+                # Remove invalid token IDs
+                valid_token_ids = [tid for tid in block_token_ids if 0 <= tid < vocab_size]
+                if not valid_token_ids:
+                    skipped_blocks += 1
+                else:
+                    token_ids.extend(valid_token_ids)
                 start = end
+            if skipped_blocks > 0:
+                print(f"[llm_codec_deterministic] Fallback tokenisation: skipped {skipped_blocks} empty or invalid blocks.", file=sys.stderr)
         if not safe_mode:
             token_ids = token_ids + [self.eof_token_id]
 
