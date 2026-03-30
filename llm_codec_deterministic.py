@@ -99,7 +99,7 @@ class DeterministicLLMCodec:
     ):
         self.tokenizer = tokenizer
         self.config = config or DeterministicCodecConfig()
-        self._diag_writer = DiagnosticsWriter(self.config.diagnostics_csv_prefix, self.tokenizer)
+        # DiagnosticsWriter is not used unless diagnostics are enabled
 
         if device == "auto":
             if torch.cuda.is_available():
@@ -135,13 +135,8 @@ class DeterministicLLMCodec:
 
         self.block_stride = max(1, self.config.context_window - self.config.margin)
 
-        if self._inference_backend == "huggingface":
-            if "<EOF>" not in self.tokenizer.all_special_tokens:
-                self.tokenizer.add_special_tokens({"additional_special_tokens": ["<EOF>"]})
-                self.model.resize_token_embeddings(len(self.tokenizer))
-            self.eof_token_id = self.tokenizer.convert_tokens_to_ids("<EOF>")
-        else:
-            self.eof_token_id = self._resolve_existing_eof_token_id()
+        # Remove <EOF> special token logic; assume EOF is handled in codec logic
+        self.eof_token_id = self._resolve_existing_eof_token_id()
 
         self.dec_prec = max(50, int(math.ceil(self.config.precision * math.log10(2))) + 10)
 
@@ -473,34 +468,11 @@ class DeterministicLLMCodec:
         memory_csv_path: str = "memory_encode.csv",
         memory_sample_interval: float = 0.05,
     ):
-        # Try to tokenise the whole text, fallback to block tokenisation if it fails
-        try:
-            token_ids = self.tokenizer.encode(text)
-        except Exception:
-            # Fallback: tokenise in smaller blocks, skip empty/invalid blocks, check token ID range
-            block_size = 256  # chars, can be tuned
-            token_ids = []
-            start = 0
-            vocab_size = len(self.tokenizer)
-            skipped_blocks = 0
-            while start < len(text):
-                end = min(start + block_size, len(text))
-                block = text[start:end]
-                try:
-                    block_token_ids = self.tokenizer.encode(block)
-                except Exception:
-                    block_token_ids = []
-                # Remove invalid token IDs
-                valid_token_ids = [tid for tid in block_token_ids if 0 <= tid < vocab_size]
-                if not valid_token_ids:
-                    skipped_blocks += 1
-                else:
-                    token_ids.extend(valid_token_ids)
-                start = end
-            if skipped_blocks > 0:
-                print(f"[llm_codec_deterministic] Fallback tokenisation: skipped {skipped_blocks} empty or invalid blocks.", file=sys.stderr)
+        # Standard tokenisation; fallback logic removed
+        token_ids = self.tokenizer.encode(text)
         if not safe_mode:
             token_ids = token_ids + [self.eof_token_id]
+
 
         writer = BitWriter()
         enc = Encoder(writer, b=self.config.precision)
@@ -509,74 +481,85 @@ class DeterministicLLMCodec:
             iterator = tqdm(iterator, total=len(token_ids), desc="Deterministic Encode")
 
         cache_state = self._init_cache_state()
-        diag_handle, diag_writer = self._diag_writer.open_writer("encode")
+        diag_handle = diag_writer = None
         demo_rows: List[Dict[str, Any]] = []
         speed_rows: List[Dict[str, Any]] = []
         monitor_state = start_memory_monitor(memory_demo, memory_sample_interval)
 
+        context_window = int(self.config.context_window)
+        vocab_size = len(self.tokenizer)
         try:
             with self._invariant_context():
                 if self.use_kv_cache:
                     cache_state = self._hard_reset_cache_and_warmup([], 0, 0)
                     cache_state["next_logits"] = self._get_logits(0, token_ids, cache_state)
 
-                for idx, token_id in iterator:
-                    iter_start = time.perf_counter()
-                    if self.config.strategy == "block" and idx > 0 and (idx % self.block_stride == 0):
-                        cache_state = self._hard_reset_cache_and_warmup(
-                            token_ids,
-                            current_index=idx,
-                            warmup_length=self.config.margin,
+                idx = 0
+                while idx < len(token_ids):
+                    # Determine the chunk size: never exceed context_window
+                    chunk_end = min(idx + context_window, len(token_ids))
+                    chunk = token_ids[idx:chunk_end]
+                    for chunk_idx, token_id in enumerate(chunk):
+                        global_idx = idx + chunk_idx
+                        iter_start = time.perf_counter()
+                        if not (0 <= int(token_id) < vocab_size):
+                            raise ValueError(f"Out-of-range token_id {token_id} at position {global_idx} (vocab_size={vocab_size})")
+                        if self.config.strategy == "block" and global_idx > 0 and (global_idx % self.block_stride == 0):
+                            cache_state = self._hard_reset_cache_and_warmup(
+                                token_ids,
+                                current_index=global_idx,
+                                warmup_length=self.config.margin,
+                            )
+
+                        logits = self._get_logits(global_idx, token_ids, cache_state)
+                        raw_probs, probs = self._raw_and_effective_probs(logits)
+                        counts = self._counts_from_probs(probs)
+
+                        if demo:
+                            p_raw = float(raw_probs[int(token_id)])
+                            p_eff = float(probs[int(token_id)])
+                            safe_raw = max(p_raw, 1e-12)
+                            demo_rows.append(
+                                {
+                                    "pos": int(global_idx),
+                                    "token_id": int(token_id),
+                                    "token": token_text_for_diag(self.tokenizer, int(token_id)),
+                                    "prob_raw": p_raw,
+                                    "prob_effective": p_eff,
+                                    "perplexity_raw": 1.0 / safe_raw,
+                                    "surprisal_bits_raw": -math.log2(safe_raw),
+                                }
+                            )
+
+                        coder_L_before = int(enc.L)
+                        coder_R_before = int(enc.R)
+                        self._diag_writer.write_token_diagnostic(
+                            diag_writer,
+                            phase="encode",
+                            step_idx=global_idx,
+                            token_id=int(token_id),
+                            raw_probs=raw_probs,
+                            effective_probs=probs,
+                            counts=counts,
+                            coder_L_before=coder_L_before,
+                            coder_R_before=coder_R_before,
+                            coder_D_before=None,
                         )
 
-                    logits = self._get_logits(idx, token_ids, cache_state)
-                    raw_probs, probs = self._raw_and_effective_probs(logits)
-                    counts = self._counts_from_probs(probs)
+                        enc.encode_symbol(token_id, counts_to_cum_desc(counts))
 
-                    if demo:
-                        p_raw = float(raw_probs[int(token_id)])
-                        p_eff = float(probs[int(token_id)])
-                        safe_raw = max(p_raw, 1e-12)
-                        demo_rows.append(
-                            {
-                                "pos": int(idx),
-                                "token_id": int(token_id),
-                                "token": token_text_for_diag(self.tokenizer, int(token_id)),
-                                "prob_raw": p_raw,
-                                "prob_effective": p_eff,
-                                "perplexity_raw": 1.0 / safe_raw,
-                                "surprisal_bits_raw": -math.log2(safe_raw),
-                            }
-                        )
+                        if global_idx < len(token_ids) - 1:
+                            cache_state = self._advance_state(token_id, cache_state)
+                            if (
+                                self.config.strategy == "rolling"
+                                and cache_state["cached_token_count"]
+                                > (self.config.context_window + self.config.margin)
+                            ):
+                                cache_state = self._truncate_cache_rolling(cache_state)
 
-                    coder_L_before = int(enc.L)
-                    coder_R_before = int(enc.R)
-                    self._diag_writer.write_token_diagnostic(
-                        diag_writer,
-                        phase="encode",
-                        step_idx=idx,
-                        token_id=int(token_id),
-                        raw_probs=raw_probs,
-                        effective_probs=probs,
-                        counts=counts,
-                        coder_L_before=coder_L_before,
-                        coder_R_before=coder_R_before,
-                        coder_D_before=None,
-                    )
-
-                    enc.encode_symbol(token_id, counts_to_cum_desc(counts))
-
-                    if idx < len(token_ids) - 1:
-                        cache_state = self._advance_state(token_id, cache_state)
-                        if (
-                            self.config.strategy == "rolling"
-                            and cache_state["cached_token_count"]
-                            > (self.config.context_window + self.config.margin)
-                        ):
-                            cache_state = self._truncate_cache_rolling(cache_state)
-
-                    if speed_demo or memory_demo:
-                        speed_rows.append({"pos": int(idx), "time": time.perf_counter() - iter_start})
+                        if speed_demo or memory_demo:
+                            speed_rows.append({"pos": int(global_idx), "time": time.perf_counter() - iter_start})
+                    idx = chunk_end
         finally:
             if diag_handle is not None:
                 diag_handle.close()
@@ -622,6 +605,7 @@ class DeterministicLLMCodec:
         speed_rows: List[Dict[str, Any]] = []
         monitor_state = start_memory_monitor(memory_demo, memory_sample_interval)
         decoded_text = ""
+        vocab_size = len(self.tokenizer)
 
         if safe_mode and expected_num_tokens is None:
             raise ValueError("safe_mode=True requires expected_num_tokens to be provided.")
@@ -661,6 +645,9 @@ class DeterministicLLMCodec:
                         coder_R_before = int(dec.R)
                         coder_D_before = int(dec.D)
                         token_id = dec.decode_symbol(counts_to_cum_desc(counts))
+                        if not (0 <= int(token_id) < vocab_size):
+                            print(f"[llm_codec_deterministic] ERROR: Out-of-range decoded token_id {token_id} at position {idx} (vocab_size={vocab_size})", file=sys.stderr)
+                            raise ValueError(f"Out-of-range decoded token_id {token_id} at position {idx} (vocab_size={vocab_size})")
 
                         self._diag_writer.write_token_diagnostic(
                             diag_writer,
@@ -737,6 +724,9 @@ class DeterministicLLMCodec:
                         coder_R_before = int(dec.R)
                         coder_D_before = int(dec.D)
                         token_id = dec.decode_symbol(counts_to_cum_desc(counts))
+                        if not (0 <= int(token_id) < vocab_size):
+                            print(f"[llm_codec_deterministic] ERROR: Out-of-range decoded token_id {token_id} at position {idx} (vocab_size={vocab_size})", file=sys.stderr)
+                            raise ValueError(f"Out-of-range decoded token_id {token_id} at position {idx} (vocab_size={vocab_size})")
 
                         self._diag_writer.write_token_diagnostic(
                             diag_writer,

@@ -235,6 +235,7 @@ def _load_codec(settings: Dict[str, Any]) -> DeterministicLLMCodec:
     if revision:
         model_kwargs["revision"] = revision
 
+
     tokenizer = AutoTokenizer.from_pretrained(
         settings["model_id"],
         trust_remote_code=bool(settings.get("trust_remote_code", False)),

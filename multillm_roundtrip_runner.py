@@ -51,15 +51,15 @@ ARTIFACT_ROOT_BASE = Path(".multillm_roundtrip_artifacts")
 IGNORE_MODEL_MAX_LENGTH_WARNING = True
 ENABLE_OOM_FALLBACK = True
 OOM_FALLBACK_STRATEGY = "rolling"  # rolling | block | no_kv_cache
-OOM_FALLBACK_CONTEXT_WINDOW = 512
-OOM_FALLBACK_MARGIN = 64
+OOM_FALLBACK_CONTEXT_WINDOW = 256
+OOM_FALLBACK_MARGIN = 32
 
 SAFE_MODE = True
 PRECISION = 32
 SLOTS = 1 << 24
-CONTEXT_WINDOW = 1024
-MARGIN = 128
-STRATEGY = "rolling"  # rolling | block | no_kv_cache
+CONTEXT_WINDOW = 512
+MARGIN = 64
+STRATEGY = "block"  # rolling | block | no_kv_cache
 USE_LEGACY_COUNTS = False
 QUANT = False
 LOGIT_ROUND_DECIMALS = 15
@@ -180,6 +180,11 @@ def main():
         log_fp.write(completed.stdout or "")
         log_fp.write(completed.stderr or "")
         log_fp.flush()
+        # TEMP: Print all output for debugging
+        print(f"\n==== Model: {model_id} STDOUT ====")
+        print(completed.stdout or "<no stdout>")
+        print(f"\n==== Model: {model_id} STDERR ====")
+        print(completed.stderr or "<no stderr>")
         if completed.returncode != 0:
             print(f"Worker failed for model {model_id}: {completed.stderr}", file=sys.stderr)
             continue
