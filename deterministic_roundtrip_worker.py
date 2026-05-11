@@ -293,6 +293,8 @@ def _load_codec(settings: Dict[str, Any]) -> DeterministicLLMCodec:
             torch_dtype=torch_dtype_name,
             vllm_tensor_parallel_size=int(settings.get("vllm_tensor_parallel_size", 1)),
             vllm_gpu_memory_utilization=float(settings.get("vllm_gpu_memory_utilization", 0.9)),
+            vllm_attention_backend=settings.get("vllm_attention_backend"),
+            vllm_use_v1=settings.get("vllm_use_v1"),
             vllm_max_logprobs=settings.get("vllm_max_logprobs"),
             vllm_max_model_len=settings.get("vllm_max_model_len"),
         )
@@ -387,6 +389,8 @@ def _phase_encode(config: Dict[str, Any], file_path: Path, artifact_dir: Path):
                     "vllm_gpu_memory_utilization": float(
                         attempt_settings.get("vllm_gpu_memory_utilization", 0.9)
                     ),
+                    "vllm_attention_backend": attempt_settings.get("vllm_attention_backend"),
+                    "vllm_use_v1": attempt_settings.get("vllm_use_v1"),
                     "vllm_max_logprobs": attempt_settings.get("vllm_max_logprobs"),
                     "vllm_max_model_len": attempt_settings.get("vllm_max_model_len"),
                     "context_window": int(attempt_settings.get("context_window", 2048)),

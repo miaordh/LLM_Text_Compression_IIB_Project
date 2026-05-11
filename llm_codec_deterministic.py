@@ -85,6 +85,8 @@ class DeterministicCodecConfig:
     torch_dtype: str = "auto"
     vllm_tensor_parallel_size: int = 1
     vllm_gpu_memory_utilization: float = 0.9
+    vllm_attention_backend: Optional[str] = None
+    vllm_use_v1: Optional[str] = None
     vllm_max_logprobs: Optional[int] = None
     vllm_max_model_len: Optional[int] = None
 
@@ -177,6 +179,8 @@ class DeterministicLLMCodec:
                 torch_dtype=str(self.config.torch_dtype),
                 tensor_parallel_size=int(self.config.vllm_tensor_parallel_size),
                 gpu_memory_utilization=float(self.config.vllm_gpu_memory_utilization),
+                attention_backend=self.config.vllm_attention_backend,
+                use_v1=self.config.vllm_use_v1,
                 max_logprobs=self.config.vllm_max_logprobs,
                 max_model_len=effective_max_model_len,
             )

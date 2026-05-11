@@ -119,9 +119,16 @@ class VLLMLogitsBackend:
         torch_dtype: str = "auto",
         tensor_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.9,
+        attention_backend: Optional[str] = None,
+        use_v1: Optional[str] = None,
         max_logprobs: Optional[int] = None,
         max_model_len: Optional[int] = None,
     ):
+        if attention_backend:
+            os.environ["VLLM_ATTENTION_BACKEND"] = str(attention_backend)
+        if use_v1 is not None and str(use_v1).strip() != "":
+            os.environ["VLLM_USE_V1"] = str(use_v1)
+
         try:
             from vllm import LLM, SamplingParams
         except Exception as exc:

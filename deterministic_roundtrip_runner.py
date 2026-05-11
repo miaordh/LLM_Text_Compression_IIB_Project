@@ -80,6 +80,8 @@ DETERMINISM_MODE = _env_str("CODEC_DETERMINISM_MODE", None)
 INFERENCE_BACKEND = _env_str("CODEC_INFERENCE_BACKEND", "huggingface")  # auto | huggingface | vllm
 VLLM_TENSOR_PARALLEL_SIZE = _env_int("CODEC_VLLM_TENSOR_PARALLEL_SIZE", 1)
 VLLM_GPU_MEMORY_UTILIZATION = _env_float("CODEC_VLLM_GPU_MEMORY_UTILIZATION", 0.9)
+VLLM_ATTENTION_BACKEND = _env_str("CODEC_VLLM_ATTENTION_BACKEND", None)
+VLLM_USE_V1 = _env_str("CODEC_VLLM_USE_V1", None)
 # None -> use tokenizer vocab size as max_logprobs for full-distribution reconstruction.
 VLLM_MAX_LOGPROBS = _env_optional_int("CODEC_VLLM_MAX_LOGPROBS", None)
 # None -> codec defaults to context_window for safer KV cache sizing.
@@ -255,6 +257,8 @@ def main():
         "inference_backend": INFERENCE_BACKEND,
         "vllm_tensor_parallel_size": VLLM_TENSOR_PARALLEL_SIZE,
         "vllm_gpu_memory_utilization": VLLM_GPU_MEMORY_UTILIZATION,
+        "vllm_attention_backend": VLLM_ATTENTION_BACKEND,
+        "vllm_use_v1": VLLM_USE_V1,
         "vllm_max_logprobs": VLLM_MAX_LOGPROBS,
         "vllm_max_model_len": VLLM_MAX_MODEL_LEN,
         "max_decode_tokens": MAX_DECODE_TOKENS,
