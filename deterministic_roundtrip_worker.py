@@ -528,17 +528,50 @@ def _run_subprocess(args: List[str], timeout_seconds: int = 0):
     try:
         completed = subprocess.run(
             args,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             timeout=timeout,
         )
-        return completed.returncode, completed.stderr
+        return completed.returncode, completed.stdout, completed.stderr
     except subprocess.TimeoutExpired as exc:
         msg = f"Timed out after {timeout_seconds}s: {' '.join(args)}"
+        stdout = exc.stdout or ""
         if exc.stderr:
             msg += f"\n{exc.stderr}"
-        return 124, msg
+        return 124, stdout, msg
+
+
+def _write_phase_logs(
+    job_dir: Path,
+    phase: str,
+    stdout_text: str,
+    stderr_text: str,
+    returncode: int,
+    args: List[str],
+):
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / f"{phase}_stdout.log").write_text(
+        stdout_text or "<empty stdout>\n",
+        encoding="utf-8",
+        errors="replace",
+    )
+    (job_dir / f"{phase}_stderr.log").write_text(
+        stderr_text or "<empty stderr>\n",
+        encoding="utf-8",
+        errors="replace",
+    )
+    (job_dir / f"{phase}_subprocess.json").write_text(
+        json.dumps(
+            {
+                "phase": phase,
+                "returncode": int(returncode),
+                "args": [str(arg) for arg in args],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
 
 def _cleanup_job_dir(job_dir: Path):
@@ -609,21 +642,21 @@ def _run_orchestrator(config_path: Path):
                 "--artifact-dir",
                 str(job_dir),
             ]
-            rc_enc, err_enc = _run_subprocess(encode_cmd, timeout_seconds=phase_timeout_seconds)
+            rc_enc, out_enc, err_enc = _run_subprocess(encode_cmd, timeout_seconds=phase_timeout_seconds)
+            _write_phase_logs(job_dir, "encode", out_enc or "", err_enc or "", rc_enc, encode_cmd)
             if rc_enc != 0:
-                attempt_count, fallback_attempted = _parse_encode_attempt_info(err_enc or "")
+                combined_enc = "\n".join(part for part in (out_enc, err_enc) if part)
+                attempt_count, fallback_attempted = _parse_encode_attempt_info(combined_enc)
                 rows.append(
                     {
                         "file": str(file_path),
                         "status": "encode_failed",
                         "num_tokens": None,
-                        "error": _sanitize_error_text(err_enc or "Encode phase failed"),
+                        "error": _sanitize_error_text(combined_enc or "Encode phase failed"),
                         "fallback_attempted": fallback_attempted,
                         "attempt_count": attempt_count,
                     }
                 )
-                if not preserve_job_artifacts:
-                    _cleanup_job_dir(job_dir)
                 continue
 
             decode_cmd = [
@@ -636,8 +669,10 @@ def _run_orchestrator(config_path: Path):
                 "--artifact-dir",
                 str(job_dir),
             ]
-            rc_dec, err_dec = _run_subprocess(decode_cmd, timeout_seconds=phase_timeout_seconds)
+            rc_dec, out_dec, err_dec = _run_subprocess(decode_cmd, timeout_seconds=phase_timeout_seconds)
+            _write_phase_logs(job_dir, "decode", out_dec or "", err_dec or "", rc_dec, decode_cmd)
             if rc_dec != 0:
+                combined_dec = "\n".join(part for part in (out_dec, err_dec) if part)
                 fallback_attempted = False
                 attempt_count = 0
                 encode_meta_for_decode = job_dir / "encode_metadata.json"
@@ -653,13 +688,11 @@ def _run_orchestrator(config_path: Path):
                         "file": str(file_path),
                         "status": "decode_failed",
                         "num_tokens": None,
-                        "error": _sanitize_error_text(err_dec or "Decode phase failed"),
+                        "error": _sanitize_error_text(combined_dec or "Decode phase failed"),
                         "fallback_attempted": fallback_attempted,
                         "attempt_count": attempt_count,
                     }
                 )
-                if not preserve_job_artifacts:
-                    _cleanup_job_dir(job_dir)
                 continue
 
             encode_meta = json.loads((job_dir / "encode_metadata.json").read_text(encoding="utf-8"))
