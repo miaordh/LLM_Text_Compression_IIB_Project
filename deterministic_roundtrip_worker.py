@@ -140,6 +140,15 @@ def _should_use_vllm(settings: Dict[str, Any], device: str, determinism_mode: Op
     return True
 
 
+def _allow_vllm_fallback(settings: Dict[str, Any], determinism_mode: Optional[str]) -> bool:
+    backend = str(settings.get("inference_backend", "auto")).strip().lower()
+    if backend == "vllm":
+        return False
+    if determinism_mode == "tbik":
+        return False
+    return backend in {"", "auto"}
+
+
 def _is_cuda_oom(exc: BaseException) -> bool:
     text = str(exc).lower()
     return "out of memory" in text and ("cuda" in text or "cudnn" in text)
@@ -292,7 +301,7 @@ def _load_codec(settings: Dict[str, Any]) -> DeterministicLLMCodec:
     try:
         return _attempt_load(vllm_flag=use_vllm)
     except Exception as e:
-        if use_vllm:
+        if use_vllm and _allow_vllm_fallback(settings, determinism_mode):
             print(f"Failed to initialize codec with vLLM backend due to: {e}. Falling back to HuggingFace.")
             settings["inference_backend"] = "huggingface"
             return _attempt_load(vllm_flag=False)

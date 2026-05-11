@@ -141,10 +141,19 @@ class VLLMLogitsBackend:
         if self._max_logprobs <= 0:
             self._max_logprobs = int(self._vocab_size)
 
+        requested_tp_size = max(1, int(tensor_parallel_size))
+        visible_gpu_count = int(torch.cuda.device_count())
+        if requested_tp_size > visible_gpu_count:
+            raise RuntimeError(
+                f"vLLM tensor_parallel_size={requested_tp_size} requires at least "
+                f"{requested_tp_size} visible CUDA devices, but torch sees {visible_gpu_count}. "
+                "Set CUDA_VISIBLE_DEVICES to include enough GPUs, for example CUDA_VISIBLE_DEVICES=0,1."
+            )
+
         engine_kwargs: Dict[str, Any] = {
             "model": model_id,
             "trust_remote_code": bool(trust_remote_code),
-            "tensor_parallel_size": max(1, int(tensor_parallel_size)),
+            "tensor_parallel_size": requested_tp_size,
             "gpu_memory_utilization": float(gpu_memory_utilization),
             "enforce_eager": True,
             "enable_prefix_caching": False,

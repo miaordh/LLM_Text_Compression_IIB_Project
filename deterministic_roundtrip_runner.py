@@ -8,15 +8,51 @@ from pathlib import Path
 from typing import List
 
 
+def _env_str(name: str, default):
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    if isinstance(default, str):
+        return value
+    lowered = value.strip().lower()
+    if lowered in {"none", "null"}:
+        return None
+    return value
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return float(value)
+
+
+def _env_optional_int(name: str, default):
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    lowered = value.strip().lower()
+    if lowered in {"none", "null"}:
+        return None
+    return int(value)
+
+
 # ---------------------------
 # Runner settings (edit me)
 # ---------------------------
-MODEL_ID = "deepseek-ai/deepseek-coder-1.3b-base"  # Model to test. Must be supported by the worker script.
-REVISION = None
+MODEL_ID = _env_str("CODEC_MODEL_ID", "deepseek-ai/deepseek-coder-1.3b-base")  # Model to test.
+REVISION = _env_str("CODEC_REVISION", None)
 TRUST_REMOTE_CODE = False
-TORCH_DTYPE = "auto"  # auto | float32 | float16 | bfloat16
-DEVICE = "mps"  # auto | cpu | cuda | mps
-DEVICE_MODE = "single_device"  # single_device | cross_device
+TORCH_DTYPE = _env_str("CODEC_TORCH_DTYPE", "auto")  # auto | float32 | float16 | bfloat16
+DEVICE = _env_str("CODEC_DEVICE", "mps")  # auto | cpu | cuda | mps
+DEVICE_MODE = _env_str("CODEC_DEVICE_MODE", "single_device")  # single_device | cross_device
 
 # Large-file safety knobs (used by worker):
 # - ignore_model_max_length_warning suppresses benign tokenizer warnings when
@@ -40,14 +76,14 @@ LOGIT_ROUND_DECIMALS = 15
 PROB_ROUND_DECIMALS = 1
 # None | batch_invariant_ops | tbik
 # In cross_device mode, worker encodes on CPU and decodes on accelerator.
-DETERMINISM_MODE = None
-INFERENCE_BACKEND = "huggingface"  # auto | huggingface | vllm
-VLLM_TENSOR_PARALLEL_SIZE = 1
-VLLM_GPU_MEMORY_UTILIZATION = 0.9
+DETERMINISM_MODE = _env_str("CODEC_DETERMINISM_MODE", None)
+INFERENCE_BACKEND = _env_str("CODEC_INFERENCE_BACKEND", "huggingface")  # auto | huggingface | vllm
+VLLM_TENSOR_PARALLEL_SIZE = _env_int("CODEC_VLLM_TENSOR_PARALLEL_SIZE", 1)
+VLLM_GPU_MEMORY_UTILIZATION = _env_float("CODEC_VLLM_GPU_MEMORY_UTILIZATION", 0.9)
 # None -> use tokenizer vocab size as max_logprobs for full-distribution reconstruction.
-VLLM_MAX_LOGPROBS = None
+VLLM_MAX_LOGPROBS = _env_optional_int("CODEC_VLLM_MAX_LOGPROBS", None)
 # None -> codec defaults to context_window for safer KV cache sizing.
-VLLM_MAX_MODEL_LEN = None
+VLLM_MAX_MODEL_LEN = _env_optional_int("CODEC_VLLM_MAX_MODEL_LEN", None)
 MAX_DECODE_TOKENS = None
 DIAGNOSTICS_ENABLED = False
 # Optional diagnostics CSV prefix. If None and diagnostics is enabled, worker writes
@@ -78,7 +114,7 @@ STOP_ON_FILE_ERROR = True
 # Parallel-run safety:
 # - RUN_TAG = None -> auto-generate unique tag per run (recommended)
 # - RUN_TAG = "mytag" -> fixed tag (you manage collisions)
-RUN_TAG = None
+RUN_TAG = _env_str("CODEC_RUN_TAG", None)
 
 # File selection for cantrbry:
 # - None: run nothing from CANTRBRY_DIR

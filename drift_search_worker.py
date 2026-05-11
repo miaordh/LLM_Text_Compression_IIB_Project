@@ -131,6 +131,15 @@ def _should_use_vllm(settings: Dict[str, Any], device: str, determinism_mode: Op
     return True
 
 
+def _allow_vllm_fallback(settings: Dict[str, Any], determinism_mode: Optional[str]) -> bool:
+    backend = str(settings.get("inference_backend", "auto")).strip().lower()
+    if backend == "vllm":
+        return False
+    if determinism_mode == "tbik":
+        return False
+    return backend in {"", "auto"}
+
+
 def _load_model_tokenizer(settings: Dict[str, Any], device: str):
     model_kwargs: Dict[str, Any] = {
         "trust_remote_code": bool(settings.get("trust_remote_code", False)),
@@ -267,6 +276,8 @@ def _run_trial_on_file(
                 ),
             )
         except Exception as e:
+            if not _allow_vllm_fallback(trial_runtime_settings, trial.get("determinism_mode")):
+                raise
             print(f"Failed to initialize vLLM for encode due to: {e}. Falling back to HuggingFace.")
             trial_runtime_settings["inference_backend"] = "huggingface"
             enc_tokenizer, enc_model, enc_use_vllm = _load_model_tokenizer(trial_runtime_settings, encode_device)
@@ -309,6 +320,8 @@ def _run_trial_on_file(
                 ),
             )
         except Exception as e:
+            if not _allow_vllm_fallback(trial_runtime_settings, trial.get("determinism_mode")):
+                raise
             print(f"Failed to initialize vLLM for decode due to: {e}. Falling back to HuggingFace.")
             trial_runtime_settings["inference_backend"] = "huggingface"
             dec_tokenizer, dec_model, dec_use_vllm = _load_model_tokenizer(trial_runtime_settings, decode_device)

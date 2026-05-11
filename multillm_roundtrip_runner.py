@@ -11,6 +11,42 @@ import time
 from pathlib import Path
 from typing import List
 
+
+def _env_str(name: str, default):
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    if isinstance(default, str):
+        return value
+    lowered = value.strip().lower()
+    if lowered in {"none", "null"}:
+        return None
+    return value
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return float(value)
+
+
+def _env_optional_int(name: str, default):
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    lowered = value.strip().lower()
+    if lowered in {"none", "null"}:
+        return None
+    return int(value)
+
 # ---------------------------
 # User settings (edit me)
 # ---------------------------
@@ -23,11 +59,11 @@ MODEL_ID_LIST = [
     "openai-community/gpt2-medium"
     # Add more model IDs here
 ]
-REVISION = None
+REVISION = _env_str("CODEC_REVISION", None)
 TRUST_REMOTE_CODE = False
-TORCH_DTYPE = "float32"
-DEVICE = "cuda"
-DEVICE_MODE = "single_device"
+TORCH_DTYPE = _env_str("CODEC_TORCH_DTYPE", "float32")
+DEVICE = _env_str("CODEC_DEVICE", "cuda")
+DEVICE_MODE = _env_str("CODEC_DEVICE_MODE", "single_device")
 
 TEXT_FILE = "my_corpus/zaobao_15_jan.txt"  # Path to the single file to test
 TEXT_ENCODING = "utf-8"
@@ -35,7 +71,7 @@ FILE_ENCODING_OVERRIDES = {"cp.html": "windows-1252"}
 
 KEEP_ARTIFACTS = True
 PHASE_TIMEOUT_SECONDS = 0  # 0 means no timeout
-RUN_TAG = None
+RUN_TAG = _env_str("CODEC_RUN_TAG", None)
 
 
 def _with_tag(path: Path, run_tag: str) -> Path:
@@ -64,12 +100,12 @@ USE_LEGACY_COUNTS = False
 QUANT = False
 LOGIT_ROUND_DECIMALS = 15
 PROB_ROUND_DECIMALS = 1
-DETERMINISM_MODE = None
-INFERENCE_BACKEND = "huggingface"  # auto | huggingface | vllm
-VLLM_TENSOR_PARALLEL_SIZE = 1
-VLLM_GPU_MEMORY_UTILIZATION = 0.9
-VLLM_MAX_LOGPROBS = None
-VLLM_MAX_MODEL_LEN = None
+DETERMINISM_MODE = _env_str("CODEC_DETERMINISM_MODE", None)
+INFERENCE_BACKEND = _env_str("CODEC_INFERENCE_BACKEND", "huggingface")  # auto | huggingface | vllm
+VLLM_TENSOR_PARALLEL_SIZE = _env_int("CODEC_VLLM_TENSOR_PARALLEL_SIZE", 1)
+VLLM_GPU_MEMORY_UTILIZATION = _env_float("CODEC_VLLM_GPU_MEMORY_UTILIZATION", 0.9)
+VLLM_MAX_LOGPROBS = _env_optional_int("CODEC_VLLM_MAX_LOGPROBS", None)
+VLLM_MAX_MODEL_LEN = _env_optional_int("CODEC_VLLM_MAX_MODEL_LEN", None)
 MAX_DECODE_TOKENS = None
 DIAGNOSTICS_ENABLED = False
 DIAGNOSTICS_CSV_PREFIX = None

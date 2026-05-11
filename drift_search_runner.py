@@ -9,20 +9,56 @@ from pathlib import Path
 from typing import Dict, List
 
 
+def _env_str(name: str, default):
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    if isinstance(default, str):
+        return value
+    lowered = value.strip().lower()
+    if lowered in {"none", "null"}:
+        return None
+    return value
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return float(value)
+
+
+def _env_optional_int(name: str, default):
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    lowered = value.strip().lower()
+    if lowered in {"none", "null"}:
+        return None
+    return int(value)
+
+
 # ---------------------------
 # Drift search settings
 # ---------------------------
-MODEL_ID = "deepseek-ai/deepseek-coder-1.3b-base"
-REVISION = None
+MODEL_ID = _env_str("CODEC_MODEL_ID", "deepseek-ai/deepseek-coder-1.3b-base")
+REVISION = _env_str("CODEC_REVISION", None)
 TRUST_REMOTE_CODE = False
-TORCH_DTYPE = "float16"  # auto | float32 | float16 | bfloat16
-DEVICE = "mps"  # auto | cpu | cuda | mps
-DEVICE_MODE = "cross_device"  # single_device | cross_device
-INFERENCE_BACKEND = "auto"  # auto | huggingface | vllm
-VLLM_TENSOR_PARALLEL_SIZE = 1
-VLLM_GPU_MEMORY_UTILIZATION = 0.9
-VLLM_MAX_LOGPROBS = None
-VLLM_MAX_MODEL_LEN = None
+TORCH_DTYPE = _env_str("CODEC_TORCH_DTYPE", "float16")  # auto | float32 | float16 | bfloat16
+DEVICE = _env_str("CODEC_DEVICE", "mps")  # auto | cpu | cuda | mps
+DEVICE_MODE = _env_str("CODEC_DEVICE_MODE", "cross_device")  # single_device | cross_device
+INFERENCE_BACKEND = _env_str("CODEC_INFERENCE_BACKEND", "auto")  # auto | huggingface | vllm
+VLLM_TENSOR_PARALLEL_SIZE = _env_int("CODEC_VLLM_TENSOR_PARALLEL_SIZE", 1)
+VLLM_GPU_MEMORY_UTILIZATION = _env_float("CODEC_VLLM_GPU_MEMORY_UTILIZATION", 0.9)
+VLLM_MAX_LOGPROBS = _env_optional_int("CODEC_VLLM_MAX_LOGPROBS", None)
+VLLM_MAX_MODEL_LEN = _env_optional_int("CODEC_VLLM_MAX_MODEL_LEN", None)
 
 SAFE_MODE = True
 MAX_DECODE_TOKENS = None
@@ -46,7 +82,7 @@ MY_CORPUS_FILE_SELECTION = None
 ARTIFICIAL_CORPUS_FILE_SELECTION = None
 
 # Search grid knobs
-DETERMINISM_MODES = [None]
+DETERMINISM_MODES = [_env_str("CODEC_DETERMINISM_MODE", None)]
 QUANT_VALUES = [True]
 SLOTS_VALUES = [1 << 15]
 # Pair logit/prob rounding together to reduce the search loop depth.
