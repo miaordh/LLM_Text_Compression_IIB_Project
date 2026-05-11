@@ -11,11 +11,11 @@ from typing import List
 # ---------------------------
 # Runner settings (edit me)
 # ---------------------------
-MODEL_ID = "Qwen/Qwen2.5-0.5B"
+MODEL_ID = "deepseek-ai/deepseek-coder-1.3b-base"  # Model to test. Must be supported by the worker script.
 REVISION = None
 TRUST_REMOTE_CODE = False
 TORCH_DTYPE = "auto"  # auto | float32 | float16 | bfloat16
-DEVICE = "cuda"  # auto | cpu | cuda | mps
+DEVICE = "mps"  # auto | cpu | cuda | mps
 DEVICE_MODE = "single_device"  # single_device | cross_device
 
 # Large-file safety knobs (used by worker):
@@ -24,16 +24,16 @@ DEVICE_MODE = "single_device"  # single_device | cross_device
 # - enable_oom_fallback retries encode with smaller KV settings on CUDA OOM.
 IGNORE_MODEL_MAX_LENGTH_WARNING = True
 ENABLE_OOM_FALLBACK = True
-OOM_FALLBACK_STRATEGY = "block"  # rolling | block | no_kv_cache
+OOM_FALLBACK_STRATEGY = "rolling"  # rolling | block | no_kv_cache
 OOM_FALLBACK_CONTEXT_WINDOW = 16
 OOM_FALLBACK_MARGIN = 2
 
 SAFE_MODE = True
 PRECISION = 32
 SLOTS = 1 << 24
-CONTEXT_WINDOW = 1024
-MARGIN = 128
-STRATEGY = "rolling"  # rolling | block | no_kv_cache
+CONTEXT_WINDOW = 100
+MARGIN = 16
+STRATEGY = "block"  # rolling | block | no_kv_cache
 USE_LEGACY_COUNTS = False
 QUANT = False
 LOGIT_ROUND_DECIMALS = 15
@@ -57,8 +57,8 @@ DIAGNOSTICS_CSV_PREFIX = None
 # Optional demo modes in llm_codec_deterministic.
 # When enabled, worker writes per-file CSVs under each file artifact directory.
 DEMO_MODE = False
-SPEED_DEMO = False
-MEMORY_DEMO = False
+SPEED_DEMO = True
+MEMORY_DEMO = True
 MEMORY_SAMPLE_INTERVAL = 0.05
 DIVERGENCE_WINDOW = 5
 
@@ -84,7 +84,7 @@ RUN_TAG = None
 # - None: run nothing from CANTRBRY_DIR
 # - "all": run every file under CANTRBRY_DIR
 # - list[str]: explicit relative filenames under CANTRBRY_DIR
-CANTRBRY_FILE_SELECTION = ["kennedy.xls"]
+CANTRBRY_FILE_SELECTION = None
 # CANTRBRY_FILE_SELECTION = None
 
 # File selection for text files using project-relative paths:
@@ -98,7 +98,7 @@ CURRENT_FOLDER_TEXT_SELECTION = None
 # - None: run nothing from MY_CORPUS_DIR
 # - "all": run every .txt file under MY_CORPUS_DIR
 # - list[str]: explicit filenames relative to MY_CORPUS_DIR
-MY_CORPUS_FILE_SELECTION = None
+MY_CORPUS_FILE_SELECTION = ["zaobao_15_jan.txt"]
 
 # File selection for artificial_corpus:
 # - None: run nothing from ARTIFICIAL_CORPUS_DIR

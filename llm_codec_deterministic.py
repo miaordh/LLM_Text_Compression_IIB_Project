@@ -131,6 +131,11 @@ class DeterministicLLMCodec:
         if self.config.margin < 0:
             raise ValueError("margin must be >= 0")
 
+        # Initialize diagnostics writer if diagnostics are enabled
+        if self.config.diagnostics_csv_prefix:
+            self._diag_writer = DiagnosticsWriter(self.config.diagnostics_csv_prefix)
+        else:
+            self._diag_writer = None
         self.use_kv_cache = self.config.strategy != "no_kv_cache"
 
         self.block_stride = max(1, self.config.context_window - self.config.margin)
@@ -533,18 +538,19 @@ class DeterministicLLMCodec:
 
                         coder_L_before = int(enc.L)
                         coder_R_before = int(enc.R)
-                        self._diag_writer.write_token_diagnostic(
-                            diag_writer,
-                            phase="encode",
-                            step_idx=global_idx,
-                            token_id=int(token_id),
-                            raw_probs=raw_probs,
-                            effective_probs=probs,
-                            counts=counts,
-                            coder_L_before=coder_L_before,
-                            coder_R_before=coder_R_before,
-                            coder_D_before=None,
-                        )
+                        if self._diag_writer is not None:
+                            self._diag_writer.write_token_diagnostic(
+                                diag_writer,
+                                phase="encode",
+                                step_idx=global_idx,
+                                token_id=int(token_id),
+                                raw_probs=raw_probs,
+                                effective_probs=probs,
+                                counts=counts,
+                                coder_L_before=coder_L_before,
+                                coder_R_before=coder_R_before,
+                                coder_D_before=None,
+                            )
 
                         enc.encode_symbol(token_id, counts_to_cum_desc(counts))
 
@@ -600,7 +606,10 @@ class DeterministicLLMCodec:
         dec = Decoder(BitReader(encoded_bytes), b=self.config.precision)
         decoded_ids = []
         cache_state = self._init_cache_state()
-        diag_handle, diag_writer = self._diag_writer.open_writer("decode")
+        if self._diag_writer is not None:
+            diag_handle, diag_writer = self._diag_writer.open_writer("decode")
+        else:
+            diag_handle, diag_writer = None, None
         demo_rows: List[Dict[str, Any]] = []
         speed_rows: List[Dict[str, Any]] = []
         monitor_state = start_memory_monitor(memory_demo, memory_sample_interval)
@@ -649,18 +658,19 @@ class DeterministicLLMCodec:
                             print(f"[llm_codec_deterministic] ERROR: Out-of-range decoded token_id {token_id} at position {idx} (vocab_size={vocab_size})", file=sys.stderr)
                             raise ValueError(f"Out-of-range decoded token_id {token_id} at position {idx} (vocab_size={vocab_size})")
 
-                        self._diag_writer.write_token_diagnostic(
-                            diag_writer,
-                            phase="decode",
-                            step_idx=idx,
-                            token_id=int(token_id),
-                            raw_probs=raw_probs,
-                            effective_probs=probs,
-                            counts=counts,
-                            coder_L_before=coder_L_before,
-                            coder_R_before=coder_R_before,
-                            coder_D_before=coder_D_before,
-                        )
+                        if self._diag_writer is not None:
+                            self._diag_writer.write_token_diagnostic(
+                                diag_writer,
+                                phase="decode",
+                                step_idx=idx,
+                                token_id=int(token_id),
+                                raw_probs=raw_probs,
+                                effective_probs=probs,
+                                counts=counts,
+                                coder_L_before=coder_L_before,
+                                coder_R_before=coder_R_before,
+                                coder_D_before=coder_D_before,
+                            )
 
                         if demo:
                             p_raw = float(raw_probs[int(token_id)])
@@ -728,18 +738,19 @@ class DeterministicLLMCodec:
                             print(f"[llm_codec_deterministic] ERROR: Out-of-range decoded token_id {token_id} at position {idx} (vocab_size={vocab_size})", file=sys.stderr)
                             raise ValueError(f"Out-of-range decoded token_id {token_id} at position {idx} (vocab_size={vocab_size})")
 
-                        self._diag_writer.write_token_diagnostic(
-                            diag_writer,
-                            phase="decode",
-                            step_idx=idx,
-                            token_id=int(token_id),
-                            raw_probs=raw_probs,
-                            effective_probs=probs,
-                            counts=counts,
-                            coder_L_before=coder_L_before,
-                            coder_R_before=coder_R_before,
-                            coder_D_before=coder_D_before,
-                        )
+                        if self._diag_writer is not None:
+                            self._diag_writer.write_token_diagnostic(
+                                diag_writer,
+                                phase="decode",
+                                step_idx=idx,
+                                token_id=int(token_id),
+                                raw_probs=raw_probs,
+                                effective_probs=probs,
+                                counts=counts,
+                                coder_L_before=coder_L_before,
+                                coder_R_before=coder_R_before,
+                                coder_D_before=coder_D_before,
+                            )
 
                         if demo:
                             p_raw = float(raw_probs[int(token_id)])
