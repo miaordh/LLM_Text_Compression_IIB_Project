@@ -105,6 +105,16 @@ def _resolve_determinism_mode(settings: Dict[str, Any]):
     return text
 
 
+def _apply_process_env_overrides(settings: Dict[str, Any]):
+    vllm_attention_backend = settings.get("vllm_attention_backend")
+    if vllm_attention_backend:
+        os.environ["VLLM_ATTENTION_BACKEND"] = str(vllm_attention_backend)
+
+    vllm_use_v1 = settings.get("vllm_use_v1")
+    if vllm_use_v1 is not None and str(vllm_use_v1).strip() != "":
+        os.environ["VLLM_USE_V1"] = str(vllm_use_v1)
+
+
 def _resolve_torch_dtype(dtype_name: str, device: str):
     if dtype_name == "auto":
         # On consumer GPUs, fp16 is typically required for 1B+ models.
@@ -221,6 +231,7 @@ def _sanitize_error_text(stderr_text: str) -> str:
 
 
 def _load_codec(settings: Dict[str, Any]) -> DeterministicLLMCodec:
+    _apply_process_env_overrides(settings)
     device = _resolve_device(settings.get("device", "auto"))
     determinism_mode = _resolve_determinism_mode(settings)
     use_vllm = _should_use_vllm(settings, device, determinism_mode)

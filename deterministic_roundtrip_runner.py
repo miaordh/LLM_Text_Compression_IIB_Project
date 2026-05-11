@@ -187,6 +187,16 @@ def _select_files(base_dir: Path, selection, txt_only: bool = False) -> List[Pat
     return selected
 
 
+def _apply_process_env_overrides(settings: dict):
+    vllm_attention_backend = settings.get("vllm_attention_backend")
+    if vllm_attention_backend:
+        os.environ["VLLM_ATTENTION_BACKEND"] = str(vllm_attention_backend)
+
+    vllm_use_v1 = settings.get("vllm_use_v1")
+    if vllm_use_v1 is not None and str(vllm_use_v1).strip() != "":
+        os.environ["VLLM_USE_V1"] = str(vllm_use_v1)
+
+
 def main():
     project_root = Path(__file__).resolve().parent
     run_tag = _resolve_run_tag()
@@ -275,6 +285,7 @@ def main():
         "phase_timeout_seconds": PHASE_TIMEOUT_SECONDS,
         "stop_on_file_error": STOP_ON_FILE_ERROR,
     }
+    _apply_process_env_overrides(settings)
 
     output_csv_path = (project_root / _with_tag(OUTPUT_CSV, run_tag)).resolve()
     config_path = (project_root / _with_tag(CONFIG_PATH, run_tag)).resolve()
