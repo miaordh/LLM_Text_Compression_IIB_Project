@@ -29,6 +29,12 @@ ROUNDTRIP_RESULT_COLUMNS = [
     "file",
     "status",
     "inference_backend",
+    "encode_inference_backend",
+    "decode_inference_backend",
+    "encode_vllm_tensor_parallel_size",
+    "decode_vllm_tensor_parallel_size",
+    "encode_determinism_mode",
+    "decode_determinism_mode",
     "input_size_bytes",
     "safe_mode",
     "num_tokens",
@@ -113,6 +119,28 @@ def _apply_process_env_overrides(settings: Dict[str, Any]):
     vllm_use_v1 = settings.get("vllm_use_v1")
     if vllm_use_v1 is not None and str(vllm_use_v1).strip() != "":
         os.environ["VLLM_USE_V1"] = str(vllm_use_v1)
+
+
+def _apply_phase_runtime_overrides(settings: Dict[str, Any], phase: str) -> Dict[str, Any]:
+    resolved = dict(settings)
+    mappings = {
+        "device": "device",
+        "determinism_mode": "determinism_mode",
+        "inference_backend": "inference_backend",
+        "torch_dtype": "torch_dtype",
+        "vllm_tensor_parallel_size": "vllm_tensor_parallel_size",
+        "vllm_gpu_memory_utilization": "vllm_gpu_memory_utilization",
+        "vllm_attention_backend": "vllm_attention_backend",
+        "vllm_use_v1": "vllm_use_v1",
+        "vllm_max_logprobs": "vllm_max_logprobs",
+        "vllm_max_model_len": "vllm_max_model_len",
+        "device_mode": "device_mode",
+    }
+    for suffix, target in mappings.items():
+        override_key = f"{phase}_{suffix}"
+        if override_key in settings and settings[override_key] is not None:
+            resolved[target] = settings[override_key]
+    return resolved
 
 
 def _resolve_torch_dtype(dtype_name: str, device: str):
@@ -323,9 +351,10 @@ def _load_codec(settings: Dict[str, Any]) -> DeterministicLLMCodec:
 
 def _phase_encode(config: Dict[str, Any], file_path: Path, artifact_dir: Path):
     settings = config["settings"]
+    encode_settings = _apply_phase_runtime_overrides(settings, "encode")
     safe_mode = bool(settings.get("safe_mode", True))
     text_encoding = _encoding_for_file(settings, file_path)
-    device_mode = _resolve_device_mode(settings)
+    device_mode = _resolve_device_mode(encode_settings)
     diagnostics_enabled = bool(settings.get("diagnostics_enabled", False))
     demo_mode = bool(settings.get("demo_mode", False))
     speed_demo = bool(settings.get("speed_demo", False))
@@ -335,13 +364,13 @@ def _phase_encode(config: Dict[str, Any], file_path: Path, artifact_dir: Path):
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
     text = _read_text(file_path, text_encoding)
-    base_attempt = dict(settings)
+    base_attempt = dict(encode_settings)
     if device_mode == "cross_device":
         base_attempt["device"] = "cpu"
     attempts = [base_attempt]
 
     if bool(settings.get("enable_oom_fallback", True)):
-        fallback_attempt = _build_oom_fallback_settings(settings)
+        fallback_attempt = _build_oom_fallback_settings(base_attempt)
         if fallback_attempt != base_attempt:
             attempts.append(fallback_attempt)
 
@@ -456,6 +485,9 @@ def _phase_decode(config: Dict[str, Any], artifact_dir: Path):
     effective_settings = encode_meta.get("effective_settings")
     if isinstance(effective_settings, dict):
         settings.update(effective_settings)
+    settings = _apply_phase_runtime_overrides(settings, "decode")
+    device_mode = _resolve_device_mode(settings)
+    decode_device_override = settings.get("decode_device_override")
 
     # Preserve run-level demo settings even if encode metadata includes effective settings.
     demo_mode = bool(encode_meta.get("demo_mode", demo_mode))
@@ -523,6 +555,18 @@ def _phase_decode(config: Dict[str, Any], artifact_dir: Path):
             "demo_mode": demo_mode,
             "speed_demo": speed_demo,
             "memory_demo": memory_demo,
+            "effective_settings": {
+                "device": settings.get("device", "auto"),
+                "torch_dtype": settings.get("torch_dtype", "auto"),
+                "inference_backend": settings.get("inference_backend", "auto"),
+                "vllm_tensor_parallel_size": int(settings.get("vllm_tensor_parallel_size", 1)),
+                "vllm_gpu_memory_utilization": float(settings.get("vllm_gpu_memory_utilization", 0.9)),
+                "vllm_attention_backend": settings.get("vllm_attention_backend"),
+                "vllm_use_v1": settings.get("vllm_use_v1"),
+                "vllm_max_logprobs": settings.get("vllm_max_logprobs"),
+                "vllm_max_model_len": settings.get("vllm_max_model_len"),
+                "determinism_mode": _resolve_determinism_mode(settings),
+            },
         }
         (artifact_dir / "decode_metadata.json").write_text(json.dumps(decode_meta, indent=2), encoding="utf-8")
     finally:
@@ -720,14 +764,26 @@ def _run_orchestrator(config_path: Path):
             )
 
             decode_meta = json.loads((job_dir / "decode_metadata.json").read_text(encoding="utf-8"))
+            encode_effective = encode_meta.get("effective_settings") or {}
+            decode_effective = decode_meta.get("effective_settings") or {}
 
             is_match = original_text == decoded_text
             row = {
                 "file": str(file_path),
                 "status": "ok" if is_match else "mismatch",
                 "inference_backend": str(
-                    (encode_meta.get("effective_settings") or {}).get("inference_backend", "auto")
+                    encode_effective.get("inference_backend", "auto")
                 ),
+                "encode_inference_backend": str(encode_effective.get("inference_backend", "auto")),
+                "decode_inference_backend": str(decode_effective.get("inference_backend", "auto")),
+                "encode_vllm_tensor_parallel_size": int(
+                    encode_effective.get("vllm_tensor_parallel_size", 1)
+                ),
+                "decode_vllm_tensor_parallel_size": int(
+                    decode_effective.get("vllm_tensor_parallel_size", 1)
+                ),
+                "encode_determinism_mode": encode_effective.get("determinism_mode"),
+                "decode_determinism_mode": decode_effective.get("determinism_mode"),
                 "input_size_bytes": encode_meta.get("original_size_bytes", 0),
                 "safe_mode": encode_meta["safe_mode"],
                 "num_tokens": encode_meta["num_tokens"],

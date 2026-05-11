@@ -79,9 +79,19 @@ PROB_ROUND_DECIMALS = 1
 DETERMINISM_MODE = _env_str("CODEC_DETERMINISM_MODE", None)
 INFERENCE_BACKEND = _env_str("CODEC_INFERENCE_BACKEND", "huggingface")  # auto | huggingface | vllm
 VLLM_TENSOR_PARALLEL_SIZE = _env_int("CODEC_VLLM_TENSOR_PARALLEL_SIZE", 1)
+ENCODE_VLLM_TENSOR_PARALLEL_SIZE = _env_optional_int("CODEC_ENCODE_VLLM_TENSOR_PARALLEL_SIZE", None)
+DECODE_VLLM_TENSOR_PARALLEL_SIZE = _env_optional_int("CODEC_DECODE_VLLM_TENSOR_PARALLEL_SIZE", None)
 VLLM_GPU_MEMORY_UTILIZATION = _env_float("CODEC_VLLM_GPU_MEMORY_UTILIZATION", 0.9)
 VLLM_ATTENTION_BACKEND = _env_str("CODEC_VLLM_ATTENTION_BACKEND", None)
 VLLM_USE_V1 = _env_str("CODEC_VLLM_USE_V1", None)
+ENCODE_INFERENCE_BACKEND = _env_str("CODEC_ENCODE_INFERENCE_BACKEND", None)
+DECODE_INFERENCE_BACKEND = _env_str("CODEC_DECODE_INFERENCE_BACKEND", None)
+ENCODE_DETERMINISM_MODE = _env_str("CODEC_ENCODE_DETERMINISM_MODE", None)
+DECODE_DETERMINISM_MODE = _env_str("CODEC_DECODE_DETERMINISM_MODE", None)
+ENCODE_VLLM_ATTENTION_BACKEND = _env_str("CODEC_ENCODE_VLLM_ATTENTION_BACKEND", None)
+DECODE_VLLM_ATTENTION_BACKEND = _env_str("CODEC_DECODE_VLLM_ATTENTION_BACKEND", None)
+ENCODE_VLLM_USE_V1 = _env_str("CODEC_ENCODE_VLLM_USE_V1", None)
+DECODE_VLLM_USE_V1 = _env_str("CODEC_DECODE_VLLM_USE_V1", None)
 # None -> use tokenizer vocab size as max_logprobs for full-distribution reconstruction.
 VLLM_MAX_LOGPROBS = _env_optional_int("CODEC_VLLM_MAX_LOGPROBS", None)
 # None -> codec defaults to context_window for safer KV cache sizing.
@@ -266,9 +276,19 @@ def main():
         "determinism_mode": DETERMINISM_MODE,
         "inference_backend": INFERENCE_BACKEND,
         "vllm_tensor_parallel_size": VLLM_TENSOR_PARALLEL_SIZE,
+        "encode_vllm_tensor_parallel_size": ENCODE_VLLM_TENSOR_PARALLEL_SIZE,
+        "decode_vllm_tensor_parallel_size": DECODE_VLLM_TENSOR_PARALLEL_SIZE,
         "vllm_gpu_memory_utilization": VLLM_GPU_MEMORY_UTILIZATION,
         "vllm_attention_backend": VLLM_ATTENTION_BACKEND,
         "vllm_use_v1": VLLM_USE_V1,
+        "encode_inference_backend": ENCODE_INFERENCE_BACKEND,
+        "decode_inference_backend": DECODE_INFERENCE_BACKEND,
+        "encode_determinism_mode": ENCODE_DETERMINISM_MODE,
+        "decode_determinism_mode": DECODE_DETERMINISM_MODE,
+        "encode_vllm_attention_backend": ENCODE_VLLM_ATTENTION_BACKEND,
+        "decode_vllm_attention_backend": DECODE_VLLM_ATTENTION_BACKEND,
+        "encode_vllm_use_v1": ENCODE_VLLM_USE_V1,
+        "decode_vllm_use_v1": DECODE_VLLM_USE_V1,
         "vllm_max_logprobs": VLLM_MAX_LOGPROBS,
         "vllm_max_model_len": VLLM_MAX_MODEL_LEN,
         "max_decode_tokens": MAX_DECODE_TOKENS,
