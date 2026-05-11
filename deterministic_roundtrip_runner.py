@@ -69,7 +69,7 @@ PRECISION = 32
 SLOTS = 1 << 24
 CONTEXT_WINDOW = 100
 MARGIN = 16
-STRATEGY = "block"  # rolling | block | no_kv_cache
+STRATEGY = "rolling"  # rolling | block | no_kv_cache
 USE_LEGACY_COUNTS = False
 QUANT = False
 LOGIT_ROUND_DECIMALS = 15
@@ -93,8 +93,8 @@ DIAGNOSTICS_CSV_PREFIX = None
 # Optional demo modes in llm_codec_deterministic.
 # When enabled, worker writes per-file CSVs under each file artifact directory.
 DEMO_MODE = False
-SPEED_DEMO = True
-MEMORY_DEMO = True
+SPEED_DEMO = False
+MEMORY_DEMO = False
 MEMORY_SAMPLE_INTERVAL = 0.05
 DIVERGENCE_WINDOW = 5
 
@@ -134,7 +134,7 @@ CURRENT_FOLDER_TEXT_SELECTION = None
 # - None: run nothing from MY_CORPUS_DIR
 # - "all": run every .txt file under MY_CORPUS_DIR
 # - list[str]: explicit filenames relative to MY_CORPUS_DIR
-MY_CORPUS_FILE_SELECTION = ["zaobao_15_jan.txt"]
+MY_CORPUS_FILE_SELECTION = ["sonnet.txt"]
 
 # File selection for artificial_corpus:
 # - None: run nothing from ARTIFICIAL_CORPUS_DIR
