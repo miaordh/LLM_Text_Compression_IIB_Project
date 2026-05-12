@@ -44,6 +44,7 @@ ROUNDTRIP_RESULT_COLUMNS = [
     "decode_seconds",
     "original_chars",
     "decoded_chars",
+    "matching_characters",
     "fallback_attempted",
     "attempt_count",
     "error",
@@ -52,6 +53,10 @@ ROUNDTRIP_RESULT_COLUMNS = [
 
 def _read_text(path: Path, encoding: str) -> str:
     return path.read_text(encoding=encoding, errors="replace")
+
+
+def _count_positionwise_matching_characters(left: str, right: str) -> int:
+    return sum(1 for a, b in zip(left, right) if a == b)
 
 
 def _encoding_for_file(settings: Dict[str, Any], file_path: Path) -> str:
@@ -797,6 +802,10 @@ def _run_orchestrator(config_path: Path):
                 "decode_seconds": decode_meta["decode_seconds"],
                 "original_chars": len(original_text),
                 "decoded_chars": decode_meta["decoded_chars"],
+                "matching_characters": _count_positionwise_matching_characters(
+                    original_text,
+                    decoded_text,
+                ),
                 "fallback_attempted": bool(encode_meta.get("used_oom_fallback", False)),
                 "attempt_count": 2 if bool(encode_meta.get("used_oom_fallback", False)) else 1,
                 "error": "",
