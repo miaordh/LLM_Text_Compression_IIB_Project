@@ -29,3 +29,6 @@ old_results/
 .multillm_roundtrip_artifacts/
 multillm_roundtrip_config*.json
 multillm_roundtrip_results*.csv
+.cross_tp_quant_artifacts/
+cross_tp_quant_config*.json
+cross_tp_quant_results*.csv
