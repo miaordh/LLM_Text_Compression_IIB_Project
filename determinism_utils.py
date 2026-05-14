@@ -227,61 +227,7 @@ class VLLMLogitsBackend:
             return float(value.logprob)
         return float(value)
 
-    def next_logits(self, prefix_ids: Sequence[int]) -> torch.Tensor:
-        prompt_ids = self._prompt_ids(prefix_ids)
-
-        outputs = None
-        last_type_error = None
-
-        generate_attempts = [
-            lambda: self._llm.generate(
-                prompt_token_ids=[prompt_ids],
-                sampling_params=self._sampling_params,
-                use_tqdm=False,
-            ),
-            lambda: self._llm.generate(
-                prompt=[prompt_ids],
-                sampling_params=self._sampling_params,
-                use_tqdm=False,
-            ),
-            lambda: self._llm.generate(
-                prompts=[prompt_ids],
-                sampling_params=self._sampling_params,
-                use_tqdm=False,
-            ),
-            lambda: self._llm.generate(
-                [{"prompt_token_ids": prompt_ids}],
-                self._sampling_params,
-                use_tqdm=False,
-            ),
-            lambda: self._llm.generate(
-                [prompt_ids],
-                self._sampling_params,
-                use_tqdm=False,
-            ),
-        ]
-
-        for attempt in generate_attempts:
-            try:
-                outputs = attempt()
-                break
-            except TypeError as exc:
-                last_type_error = exc
-                continue
-
-        if outputs is None:
-            if last_type_error is not None:
-                raise last_type_error
-            raise RuntimeError("vLLM generate returned no result and no TypeError was captured")
-
-        if not outputs or not outputs[0].outputs:
-            raise RuntimeError("vLLM returned empty outputs while requesting next-token logits")
-
-        token_logprobs = outputs[0].outputs[0].logprobs
-        if not token_logprobs:
-            raise RuntimeError("vLLM did not return token logprobs for the next token")
-
-        step_dict = token_logprobs[0]
+    def _logits_from_step_dict(self, step_dict: Dict[Any, Any]) -> torch.Tensor:
         probs = np.zeros((self._vocab_size,), dtype=np.float64)
         assigned = np.zeros((self._vocab_size,), dtype=np.bool_)
 
@@ -311,6 +257,85 @@ class VLLMLogitsBackend:
 
         logits = np.log(np.clip(probs, 1e-45, 1.0)).astype(np.float32, copy=False)
         return torch.from_numpy(logits).to(device=self._device)
+
+    def _generate_for_prompt_ids(self, prompt_ids_list: Sequence[Sequence[int]]):
+        prompt_ids_list = [[int(token_id) for token_id in prompt_ids] for prompt_ids in prompt_ids_list]
+        outputs = None
+        last_type_error = None
+
+        generate_attempts = [
+            lambda: self._llm.generate(
+                prompt_token_ids=prompt_ids_list,
+                sampling_params=self._sampling_params,
+                use_tqdm=False,
+            ),
+            lambda: self._llm.generate(
+                prompt=prompt_ids_list,
+                sampling_params=self._sampling_params,
+                use_tqdm=False,
+            ),
+            lambda: self._llm.generate(
+                prompts=prompt_ids_list,
+                sampling_params=self._sampling_params,
+                use_tqdm=False,
+            ),
+            lambda: self._llm.generate(
+                [{"prompt_token_ids": prompt_ids} for prompt_ids in prompt_ids_list],
+                self._sampling_params,
+                use_tqdm=False,
+            ),
+            lambda: self._llm.generate(
+                prompt_ids_list,
+                self._sampling_params,
+                use_tqdm=False,
+            ),
+        ]
+
+        for attempt in generate_attempts:
+            try:
+                outputs = attempt()
+                break
+            except TypeError as exc:
+                last_type_error = exc
+                continue
+
+        if outputs is None:
+            if last_type_error is not None:
+                raise last_type_error
+            raise RuntimeError("vLLM generate returned no result and no TypeError was captured")
+        return outputs
+
+    def next_logits(self, prefix_ids: Sequence[int]) -> torch.Tensor:
+        prompt_ids = self._prompt_ids(prefix_ids)
+        return self.next_logits_batch([prompt_ids], already_prompt_ids=True)[0]
+
+    def next_logits_batch(
+        self,
+        prefix_ids_list: Sequence[Sequence[int]],
+        already_prompt_ids: bool = False,
+    ) -> List[torch.Tensor]:
+        if already_prompt_ids:
+            prompt_ids_list = [[int(token_id) for token_id in prefix_ids] for prefix_ids in prefix_ids_list]
+        else:
+            prompt_ids_list = [self._prompt_ids(prefix_ids) for prefix_ids in prefix_ids_list]
+
+        outputs = self._generate_for_prompt_ids(prompt_ids_list)
+        if not outputs or not outputs[0].outputs:
+            raise RuntimeError("vLLM returned empty outputs while requesting next-token logits")
+        if len(outputs) != len(prompt_ids_list):
+            raise RuntimeError(
+                f"vLLM returned {len(outputs)} outputs for {len(prompt_ids_list)} prompts"
+            )
+
+        logits_list: List[torch.Tensor] = []
+        for output in outputs:
+            if not output.outputs:
+                raise RuntimeError("vLLM returned an empty per-prompt output")
+            token_logprobs = output.outputs[0].logprobs
+            if not token_logprobs:
+                raise RuntimeError("vLLM did not return token logprobs for the next token")
+            logits_list.append(self._logits_from_step_dict(token_logprobs[0]))
+        return logits_list
 
 
 def cpu_batch_invariant_log_softmax(input_tensor: torch.Tensor, dim: int = -1) -> torch.Tensor:

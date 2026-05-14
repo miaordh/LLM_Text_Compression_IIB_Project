@@ -35,6 +35,7 @@ ROUNDTRIP_RESULT_COLUMNS = [
     "decode_vllm_tensor_parallel_size",
     "encode_determinism_mode",
     "decode_determinism_mode",
+    "encode_batch_size",
     "input_size_bytes",
     "safe_mode",
     "num_tokens",
@@ -365,6 +366,7 @@ def _phase_encode(config: Dict[str, Any], file_path: Path, artifact_dir: Path):
     speed_demo = bool(settings.get("speed_demo", False))
     memory_demo = bool(settings.get("memory_demo", False))
     memory_sample_interval = float(settings.get("memory_sample_interval", 0.05))
+    encode_batch_size = max(1, int(encode_settings.get("encode_batch_size", settings.get("encode_batch_size", 1))))
 
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
@@ -389,19 +391,26 @@ def _phase_encode(config: Dict[str, Any], file_path: Path, artifact_dir: Path):
             codec = _load_codec(attempt_settings)
 
             start = time.time()
-            encoded_result = codec.encode(
-                text,
-                safe_mode=safe_mode,
-                return_token_count=True,
-                show_progress=False,
-                demo=demo_mode,
-                demo_csv_path=str(artifact_dir / "demo_encode.csv"),
-                speed_demo=speed_demo,
-                speed_csv_path=str(artifact_dir / "speed_encode.csv"),
-                memory_demo=memory_demo,
-                memory_csv_path=str(artifact_dir / "memory_encode.csv"),
-                memory_sample_interval=memory_sample_interval,
-            )
+            encode_kwargs: Dict[str, Any] = {
+                "safe_mode": safe_mode,
+                "return_token_count": True,
+                "show_progress": False,
+                "demo": demo_mode,
+                "demo_csv_path": str(artifact_dir / "demo_encode.csv"),
+                "speed_demo": speed_demo,
+                "speed_csv_path": str(artifact_dir / "speed_encode.csv"),
+                "memory_demo": memory_demo,
+                "memory_csv_path": str(artifact_dir / "memory_encode.csv"),
+                "memory_sample_interval": memory_sample_interval,
+            }
+            if encode_batch_size > 1:
+                encoded_result = codec.encode_batched(
+                    text,
+                    batch_size=encode_batch_size,
+                    **encode_kwargs,
+                )
+            else:
+                encoded_result = codec.encode(text, **encode_kwargs)
             encode_seconds = time.time() - start
 
             if isinstance(encoded_result, tuple):
@@ -438,6 +447,7 @@ def _phase_encode(config: Dict[str, Any], file_path: Path, artifact_dir: Path):
                     "vllm_use_v1": attempt_settings.get("vllm_use_v1"),
                     "vllm_max_logprobs": attempt_settings.get("vllm_max_logprobs"),
                     "vllm_max_model_len": attempt_settings.get("vllm_max_model_len"),
+                    "encode_batch_size": encode_batch_size,
                     "context_window": int(attempt_settings.get("context_window", 2048)),
                     "margin": int(attempt_settings.get("margin", 128)),
                     "strategy": str(attempt_settings.get("strategy", "rolling")),
@@ -789,6 +799,7 @@ def _run_orchestrator(config_path: Path):
                 ),
                 "encode_determinism_mode": encode_effective.get("determinism_mode"),
                 "decode_determinism_mode": decode_effective.get("determinism_mode"),
+                "encode_batch_size": int(encode_effective.get("encode_batch_size", 1)),
                 "input_size_bytes": encode_meta.get("original_size_bytes", 0),
                 "safe_mode": encode_meta["safe_mode"],
                 "num_tokens": encode_meta["num_tokens"],

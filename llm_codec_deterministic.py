@@ -256,6 +256,59 @@ class DeterministicLLMCodec:
             )
         return out.logits[0, -1, :]
 
+    def _logits_for_prefix_batch(self, prefixes: Sequence[Sequence[int]]) -> List[torch.Tensor]:
+        if not prefixes:
+            return []
+
+        if self._vllm_backend is not None:
+            return self._vllm_backend.next_logits_batch(prefixes)
+
+        bos = self.tokenizer.bos_token_id
+        if bos is None:
+            bos = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = bos if bos is not None else 0
+
+        contexts: List[List[int]] = []
+        for prefix_ids in prefixes:
+            context = [int(token_id) for token_id in prefix_ids]
+            if not context:
+                context = [int(bos if bos is not None else 0)]
+            contexts.append(context)
+
+        max_len = max(len(context) for context in contexts)
+        input_ids = torch.full(
+            (len(contexts), max_len),
+            int(pad_id),
+            dtype=torch.long,
+            device=self.device,
+        )
+        attention_mask = torch.zeros(
+            (len(contexts), max_len),
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        for row, context in enumerate(contexts):
+            valid_len = len(context)
+            input_ids[row, :valid_len] = torch.tensor(context, dtype=torch.long, device=self.device)
+            attention_mask[row, :valid_len] = 1
+
+        position_ids = self._position_ids_from_mask(attention_mask)
+        with torch.no_grad():
+            out = self.model(
+                input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False,
+            )
+
+        logits_list: List[torch.Tensor] = []
+        for row, context in enumerate(contexts):
+            logits_list.append(out.logits[row, len(context) - 1, :])
+        return logits_list
+
     def _init_cache_state(self):
         return {
             "past_key_values": None,
@@ -573,6 +626,110 @@ class DeterministicLLMCodec:
         finally:
             if diag_handle is not None:
                 diag_handle.close()
+            if memory_demo:
+                memory_rows = stop_memory_monitor(monitor_state, speed_rows)
+                write_csv_rows(memory_csv_path, memory_rows)
+
+        enc.finish()
+        writer.flush()
+        encoded_bytes = writer.getvalue()
+
+        if speed_demo:
+            write_csv_rows(speed_csv_path, speed_rows)
+        if demo:
+            write_csv_rows(demo_csv_path, demo_rows)
+
+        if safe_mode or return_token_count:
+            return encoded_bytes, len(token_ids)
+        return encoded_bytes
+
+    def encode_batched(
+        self,
+        text: str,
+        batch_size: int = 8,
+        safe_mode: bool = False,
+        return_token_count: bool = False,
+        show_progress: bool = True,
+        demo: bool = False,
+        demo_csv_path: str = "compression_stats.csv",
+        speed_demo: bool = False,
+        speed_csv_path: str = "speed_encode.csv",
+        memory_demo: bool = False,
+        memory_csv_path: str = "memory_encode.csv",
+        memory_sample_interval: float = 0.05,
+    ):
+        if self.config.strategy != "no_kv_cache":
+            raise ValueError(
+                "Batched teacher-forced encode requires strategy='no_kv_cache' so decode "
+                "can replay the same context-window probability stream sequentially."
+            )
+
+        token_ids = self.tokenizer.encode(text)
+        if not safe_mode:
+            token_ids = token_ids + [self.eof_token_id]
+
+        batch_size = max(1, int(batch_size))
+        writer = BitWriter()
+        enc = Encoder(writer, b=self.config.precision)
+        demo_rows: List[Dict[str, Any]] = []
+        speed_rows: List[Dict[str, Any]] = []
+        monitor_state = start_memory_monitor(memory_demo, memory_sample_interval)
+
+        context_window = int(self.config.context_window)
+        vocab_size = len(self.tokenizer)
+        indices = range(0, len(token_ids), batch_size)
+        if show_progress:
+            indices = tqdm(indices, total=math.ceil(len(token_ids) / batch_size), desc="Batched Encode")
+
+        try:
+            with self._invariant_context():
+                for batch_start in indices:
+                    batch_end = min(int(batch_start) + batch_size, len(token_ids))
+                    positions = list(range(int(batch_start), batch_end))
+                    prefixes = [
+                        token_ids[max(0, pos - context_window):pos]
+                        for pos in positions
+                    ]
+                    iter_start = time.perf_counter()
+                    logits_batch = self._logits_for_prefix_batch(prefixes)
+                    if len(logits_batch) != len(positions):
+                        raise RuntimeError(
+                            f"Expected {len(positions)} batched logits rows, got {len(logits_batch)}"
+                        )
+
+                    for pos, logits in zip(positions, logits_batch):
+                        token_id = int(token_ids[pos])
+                        if not (0 <= token_id < vocab_size):
+                            raise ValueError(
+                                f"Out-of-range token_id {token_id} at position {pos} "
+                                f"(vocab_size={vocab_size})"
+                            )
+
+                        raw_probs, probs = self._raw_and_effective_probs(logits)
+                        counts = self._counts_from_probs(probs)
+                        enc.encode_symbol(token_id, counts_to_cum_desc(counts))
+
+                        if demo:
+                            p_raw = float(raw_probs[token_id])
+                            p_eff = float(probs[token_id])
+                            safe_raw = max(p_raw, 1e-12)
+                            demo_rows.append(
+                                {
+                                    "pos": int(pos),
+                                    "token_id": token_id,
+                                    "token": token_text_for_diag(self.tokenizer, token_id),
+                                    "prob_raw": p_raw,
+                                    "prob_effective": p_eff,
+                                    "perplexity_raw": 1.0 / safe_raw,
+                                    "surprisal_bits_raw": -math.log2(safe_raw),
+                                }
+                            )
+
+                    if speed_demo or memory_demo:
+                        per_token_time = (time.perf_counter() - iter_start) / max(1, len(positions))
+                        for pos in positions:
+                            speed_rows.append({"pos": int(pos), "time": per_token_time})
+        finally:
             if memory_demo:
                 memory_rows = stop_memory_monitor(monitor_state, speed_rows)
                 write_csv_rows(memory_csv_path, memory_rows)
