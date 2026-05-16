@@ -295,7 +295,7 @@ def main():
     parser.add_argument("--model-id", default=_env_str("CODEC_MODEL_ID", "deepseek-ai/deepseek-coder-1.3b-base"))
     parser.add_argument("--revision", default=_env_str("CODEC_REVISION", None))
     parser.add_argument("--trust-remote-code", action="store_true")
-    parser.add_argument("--prompt", default=_env_str("LOGITS_PROBE_PROMPT", "def add(a, b):"))
+    parser.add_argument("--prompt", default=_env_str("LOGITS_PROBE_PROMPT", "轻轻的我走了 正如我轻轻的来 我轻轻的招手 作别西天的云彩"))
     parser.add_argument("--repeats", type=int, default=_env_int("LOGITS_PROBE_REPEATS", 100))
     parser.add_argument("--top-k", type=int, default=_env_int("LOGITS_PROBE_TOP_K", 20))
     parser.add_argument("--output-dir", default=_env_str("LOGITS_PROBE_OUTPUT_DIR", "results/logits_repeatability/hf_single_gpu_none"))

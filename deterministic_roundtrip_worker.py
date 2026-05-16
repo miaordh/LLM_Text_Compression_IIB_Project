@@ -57,7 +57,13 @@ def _read_text(path: Path, encoding: str) -> str:
 
 
 def _count_positionwise_matching_characters(left: str, right: str) -> int:
-    return sum(1 for a, b in zip(left, right) if a == b)
+    count = 0
+    for a, b in zip(left, right):
+        if a == b:
+            count += 1
+        else:
+            break
+    return count
 
 
 def _encoding_for_file(settings: Dict[str, Any], file_path: Path) -> str:
