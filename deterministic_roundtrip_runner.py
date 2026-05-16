@@ -34,6 +34,13 @@ def _env_float(name: str, default: float) -> float:
     return float(value)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def _env_optional_int(name: str, default):
     value = os.environ.get(name)
     if value is None or value == "":
@@ -65,15 +72,15 @@ OOM_FALLBACK_CONTEXT_WINDOW = 16
 OOM_FALLBACK_MARGIN = 2
 
 SAFE_MODE = True
-PRECISION = 32
-SLOTS = 1 << 24
+PRECISION = _env_int("CODEC_PRECISION", 32)
+SLOTS = _env_int("CODEC_SLOTS", 1 << 24)
 CONTEXT_WINDOW = 100
 MARGIN = 16
 STRATEGY = "rolling"  # rolling | block | no_kv_cache
 USE_LEGACY_COUNTS = False
-QUANT = False
-LOGIT_ROUND_DECIMALS = 15
-PROB_ROUND_DECIMALS = 1
+QUANT = _env_bool("CODEC_QUANT", False)
+LOGIT_ROUND_DECIMALS = _env_int("CODEC_LOGIT_ROUND_DECIMALS", 15)
+PROB_ROUND_DECIMALS = _env_int("CODEC_PROB_ROUND_DECIMALS", 1)
 # None | batch_invariant_ops | tbik
 # In cross_device mode, worker encodes on CPU and decodes on accelerator.
 DETERMINISM_MODE = _env_str("CODEC_DETERMINISM_MODE", None)
