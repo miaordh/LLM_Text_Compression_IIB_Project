@@ -148,7 +148,7 @@ def main():
         decode_start = time.time()
         decoded_text_ac = decoder.decode_AC(total_length, pad_len, vocab_size)
         metrics["decompression_time_seconds"] = float(time.time() - decode_start)
-        verify_text(compressed_file_name, str(input_file), decoded_text_ac)
+        verify_text(str(output_dir / input_file.stem), str(input_file), decoded_text_ac)
         metrics["roundtrip_ok"] = _roundtrip_ok(input_file, decoded_text_ac)
 
     _write_metrics_csv(output_dir, metrics)

@@ -36,3 +36,4 @@ cross_tp_quant_results*.csv
 policy_corpus/
 policy_corpus_readme.md/
 enwik9/
+FineZip_outputs/
